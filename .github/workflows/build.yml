@@ -1,0 +1,50 @@
+name: Compilar APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Descargar Spotify App Remote SDK
+        run: |
+          git clone --depth 1 https://github.com/spotify/android-sdk /tmp/spotify-sdk
+          mkdir -p app/libs
+          find /tmp/spotify-sdk -name 'spotify-app-remote*.aar' -exec cp {} app/libs/ \;
+          ls -la app/libs
+          test -n "$(ls app/libs/*.aar)"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compilar
+        run: gradle assembleRelease --stacktrace
+
+      - name: Renombrar APK
+        run: cp app/build/outputs/apk/release/app-release.apk WalkmanUL.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WalkmanUL
+          path: WalkmanUL.apk
+
+      - name: Publicar release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Walkman UL ${{ github.run_number }}
+          files: WalkmanUL.apk
