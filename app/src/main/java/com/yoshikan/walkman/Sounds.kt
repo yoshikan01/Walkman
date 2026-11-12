@@ -32,7 +32,7 @@ class Sounds(context: Context) {
         clackId = pool.load(write(dir, "clack.wav", clack(0.06, 110.0, 1.0)), 1)
         tickId = pool.load(write(dir, "tick.wav", clack(0.025, 220.0, 0.5)), 1)
         switchId = pool.load(write(dir, "switch.wav", clack(0.03, 600.0, 0.45)), 1)
-        ejectId = pool.load(write(dir, "eject.wav", eject()), 1)
+        ejectId = pool.load(write(dir, "eject.wav", ejectPcm()), 1)
     }
 
     fun clack() { pool.play(clackId, 0.9f, 0.9f, 1, 0, 1f) }
@@ -58,7 +58,7 @@ class Sounds(context: Context) {
         return out
     }
 
-    private fun eject(): ShortArray {
+    private fun ejectPcm(): ShortArray {
         val n = (rate * 0.35).toInt()
         val out = ShortArray(n)
         val rnd = Random(11)
