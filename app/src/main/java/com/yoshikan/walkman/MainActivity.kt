@@ -16,6 +16,7 @@ import android.graphics.SweepGradient
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -23,7 +24,11 @@ import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.FrameLayout
@@ -31,9 +36,6 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
-import com.spotify.sdk.android.auth.AuthorizationClient
-import com.spotify.sdk.android.auth.AuthorizationRequest
-import com.spotify.sdk.android.auth.AuthorizationResponse
 
 class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
 
@@ -49,10 +51,10 @@ class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
     private lateinit var sounds: Sounds
     private val meter = AudioMeter()
     private val handler = Handler(Looper.getMainLooper())
-    private lateinit var spotify: SpotifySource
+    private var spotify: MusicSource? = null
     private lateinit var universal: UniversalSource
     private lateinit var source: MusicSource
-    private var authInFlight = false
+    private var backCb: Any? = null
     private var lastTrack: String? = null
     private var scanDir = 0
     private var sleepAt = 0L
@@ -89,10 +91,10 @@ class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
         prefs = getSharedPreferences("walkman", Context.MODE_PRIVATE)
         sounds = Sounds(this)
 
-        spotify = SpotifySource(this)
-        spotify.needAuth = { startAuth() }
+        spotify = Flavor.createSpotify(this, AUTH_REQ)
         universal = UniversalSource(this)
-        source = if (prefs.getString("source", "spotify") == "universal") universal else spotify
+        val sp = spotify
+        source = if (sp != null && prefs.getString("source", "spotify") == "spotify") sp else universal
 
         val root = FrameLayout(this)
         root.setBackgroundColor(col(0xFF0D0E10))
@@ -119,6 +121,14 @@ class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
 
     @Suppress("DEPRECATION")
     private fun hideBars() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            val ic = window.insetsController
+            if (ic != null) {
+                ic.hide(WindowInsets.Type.systemBars())
+                ic.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                return
+            }
+        }
         window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
             or View.SYSTEM_UI_FLAG_FULLSCREEN
             or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
@@ -189,30 +199,13 @@ class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
 
     override fun note(s: String) { toast(s) }
 
-    // ================= Spotify auth =================
-
-    private fun startAuth() {
-        if (authInFlight) return
-        authInFlight = true
-        d.status = "Pidiendo permiso a Spotify…"
-        val req = AuthorizationRequest.Builder(SpotifySource.CLIENT_ID, AuthorizationResponse.Type.TOKEN, SpotifySource.REDIRECT_URI)
-            .setScopes(arrayOf("app-remote-control", "streaming", "user-read-playback-state", "user-modify-playback-state", "user-read-recently-played", "playlist-read-private"))
-            .setShowDialog(false)
-            .build()
-        AuthorizationClient.openLoginActivity(this, AUTH_REQ, req)
-    }
+    // ================= Spotify (solo edición personal) =================
 
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != AUTH_REQ) return
-        authInFlight = false
-        val resp = AuthorizationClient.getResponse(resultCode, data)
-        when (resp.type) {
-            AuthorizationResponse.Type.TOKEN -> { spotify.token = resp.accessToken; if (source === spotify) spotify.start() }
-            AuthorizationResponse.Type.ERROR -> { d.status = "Spotify rechazó el acceso: " + resp.error; toast(d.status) }
-            else -> d.status = "Autorización cancelada · toca el aparato"
-        }
+        Flavor.handleAuth(spotify, this, resultCode, data, source === spotify)
     }
 
     // ================= micrófono para niveles reales =================
@@ -321,26 +314,29 @@ class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
 
     override fun onSkinMenu() {
         val names = walkman.skins.map { it.name }.toTypedArray()
-        val other = if (source === spotify) "Universal (cualquier app)" else "Spotify"
-        AlertDialog.Builder(this)
+        val b = AlertDialog.Builder(this)
             .setTitle("Elige tu aparato")
             .setSingleChoiceItems(names, walkman.skinIndex) { dlg, which ->
                 walkman.switchSkin(which)
                 onSkinChanged(which)
                 dlg.dismiss()
             }
-            .setNeutralButton("Fuente: ${source.label} → $other") { _, _ -> switchSource() }
-            .show()
+        if (spotify != null) {
+            val other = if (source === spotify) "Universal (cualquier app)" else "Spotify"
+            b.setNeutralButton("Fuente: ${source.label} → $other") { _, _ -> switchSource() }
+        }
+        b.show()
     }
 
     private fun switchSource() {
+        val sp = spotify ?: return
         source.stop()
-        source = if (source === spotify) universal else spotify
+        source = if (source === sp) universal else sp
         prefs.edit().putString("source", if (source === universal) "universal" else "spotify").apply()
         lastTrack = null
         d.hasTrack = false; d.isPlaying = false; d.art = null; d.connected = false
         updateAmbient()
-        toast(if (source === universal) "Fuente universal: controla Spotify, YouTube Music, Apple Music o cualquier app" else "Fuente: Spotify")
+        toast(if (source === universal) "Fuente universal: controla la app de música que estés usando" else "Fuente: Spotify")
         source.start()
     }
 
@@ -466,6 +462,7 @@ class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
         shelf.setBackgroundColor(s.shelfBg)
         shelfTitle.text = s.shelfTitle + " · " + source.label.uppercase()
         shelf.visibility = View.VISIBLE
+        setBackHandler(true)
         rows.clear()
         thumbs.clear()
         shelfAdapter.notifyDataSetChanged()
@@ -476,6 +473,22 @@ class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
     private fun closeShelf() {
         sounds.play(Sounds.Ev.KEY_DOWN)
         shelf.visibility = View.GONE
+        setBackHandler(false)
+    }
+
+    /** Botón "atrás" de Android 13+ (atrás predictivo): cierra el estante. */
+    private fun setBackHandler(on: Boolean) {
+        if (Build.VERSION.SDK_INT < 33) return
+        val disp = onBackInvokedDispatcher
+        if (on && backCb == null) {
+            val cb = OnBackInvokedCallback { closeShelf() }
+            disp.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
+            backCb = cb
+        } else if (!on) {
+            val cb = backCb as? OnBackInvokedCallback ?: return
+            disp.unregisterOnBackInvokedCallback(cb)
+            backCb = null
+        }
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()

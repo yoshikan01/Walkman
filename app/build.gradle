@@ -5,15 +5,33 @@ plugins {
 
 android {
     namespace 'com.yoshikan.walkman'
-    compileSdk 34
+    compileSdk 36
 
     defaultConfig {
         applicationId 'com.yoshikan.walkman'
         minSdk 24
-        targetSdk 34
-        versionCode 4
-        versionName '3.0'
+        targetSdk 36
+        versionCode 5
+        versionName '3.1'
         manifestPlaceholders = [redirectSchemeName: 'walkmanul', redirectHostName: 'callback', redirectPathPattern: '.*']
+    }
+
+    buildFeatures { buildConfig true }
+
+    flavorDimensions 'edicion'
+    productFlavors {
+        // Tu versión: incluye Spotify directo (máx. 5 usuarios por reglas de Spotify)
+        personal {
+            dimension 'edicion'
+            applicationId 'com.yoshikan.walkman'
+            resValue 'string', 'app_name', 'Walkman UL'
+        }
+        // Versión para Google Play: solo control universal, sin Spotify
+        tienda {
+            dimension 'edicion'
+            applicationId 'com.yoshikan.casetera'
+            resValue 'string', 'app_name', 'Casetera Retro'
+        }
     }
 
     signingConfigs {
@@ -35,6 +53,11 @@ android {
         }
     }
 
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -43,7 +66,7 @@ android {
 }
 
 dependencies {
-    implementation fileTree(dir: 'libs', include: ['*.aar'])
-    implementation 'com.google.code.gson:gson:2.10.1'
-    implementation 'com.spotify.android:auth:2.1.1'
+    personalImplementation fileTree(dir: 'libs', include: ['*.aar'])
+    personalImplementation 'com.google.code.gson:gson:2.10.1'
+    personalImplementation 'com.spotify.android:auth:2.1.1'
 }

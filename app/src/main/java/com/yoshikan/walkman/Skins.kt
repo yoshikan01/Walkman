@@ -35,7 +35,7 @@ class Deck {
     var title = ""
     var artist = ""
     var album = ""
-    var status = "Conectando con Spotify…"
+    var status = "Conectando…"
     var art: Bitmap? = null
     var durationMs = 1L
     var basePosMs = 0L
@@ -219,7 +219,7 @@ abstract class Skin {
     }
 
     protected fun lineOne(d: Deck): String = when {
-        !d.connected -> "Toca aquí para conectar Spotify"
+        !d.connected -> "Toca aquí para conectar tu música"
         !d.hasTrack -> "Sin música · STOP / EJECT"
         else -> d.title
     }
@@ -626,7 +626,7 @@ class TurntableSkin : Skin() {
 // 3. Discman / CD
 // =====================================================================
 class DiscmanSkin : Skin() {
-    override val name = "Discman"
+    override val name = "CD portátil"
     override val aspect = 0.95f
     override val kind = SoundKind.CD
     override val ambient = Ambient.HISS
@@ -691,7 +691,7 @@ class DiscmanSkin : Skin() {
         p.strokeWidth = 2f; p.color = 0x55FFFFFF
         c.drawCircle(cx, cy, lidR * 0.98f, p)
         p.style = Paint.Style.FILL
-        text(c, "UL DISCMAN", cx, cy + lidR * 0.80f, lidR * 0.09f, 0xAAFFFFFF.toInt(), tf = black)
+        text(c, "UL COMPACT PLAYER", cx, cy + lidR * 0.80f, lidR * 0.09f, 0xAAFFFFFF.toInt(), tf = black)
         text(c, "ESP · ANTI-SKIP · 1-BIT DAC", cx, cy - lidR * 0.80f, lidR * 0.06f, 0x99FFFFFF.toInt())
 
         // pantalla LCD

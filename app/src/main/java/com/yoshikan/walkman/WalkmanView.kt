@@ -323,7 +323,7 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         tp.typeface = condensed; tp.textAlign = Paint.Align.LEFT
         val t1: String; val t2: String; val red: Boolean
         when {
-            !d.connected -> { t1 = "Toca el aparato para conectar con Spotify"; t2 = d.status; red = true }
+            !d.connected -> { t1 = "Toca el aparato para conectar tu música"; t2 = d.status; red = true }
             !d.hasTrack -> { t1 = "Sin música"; t2 = "STOP / EJECT abre tus recientes"; red = false }
             else -> { t1 = d.title; t2 = listOf(d.artist, d.album).filter { it.isNotEmpty() }.joinToString(" · "); red = false }
         }

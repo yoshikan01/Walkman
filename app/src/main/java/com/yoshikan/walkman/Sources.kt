@@ -16,21 +16,12 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
-import com.spotify.android.appremote.api.ConnectionParams
-import com.spotify.android.appremote.api.Connector
-import com.spotify.android.appremote.api.ContentApi
-import com.spotify.android.appremote.api.SpotifyAppRemote
-import com.spotify.protocol.types.Image
-import com.spotify.protocol.types.ListItem
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
 import java.util.concurrent.Executors
 
 /** Servicio vacío: Android exige un "lector de notificaciones" para dejarnos ver los controles de música. */
@@ -108,168 +99,6 @@ object Net {
 }
 
 // =====================================================================
-// Spotify (SDK App Remote + historial exacto por Web API)
-// =====================================================================
-class SpotifySource(private val host: SourceHost) : MusicSource {
-    companion object {
-        const val CLIENT_ID = "1d4f1c05d332459b8ff8cd74e247cf9a"
-        const val REDIRECT_URI = "walkmanul://callback"
-    }
-
-    override val label = "Spotify"
-    var token: String? = null
-    var needAuth: (() -> Unit)? = null
-    private var remote: SpotifyAppRemote? = null
-    private var connecting = false
-    private var lastImage: String? = null
-    override val connected get() = remote != null
-
-    override fun start() {
-        val ctx = host.ctx
-        if (token == null) { needAuth?.invoke(); return }
-        if (remote != null || connecting) return
-        if (!SpotifyAppRemote.isSpotifyInstalled(ctx)) {
-            host.onConnection(false, "Instala Spotify o cambia la fuente a Universal")
-            return
-        }
-        connecting = true
-        host.onConnection(false, "Conectando con Spotify…")
-        val params = ConnectionParams.Builder(CLIENT_ID).setRedirectUri(REDIRECT_URI).showAuthView(false).build()
-        SpotifyAppRemote.connect(ctx, params, object : Connector.ConnectionListener {
-            override fun onConnected(r: SpotifyAppRemote) {
-                connecting = false
-                remote = r
-                host.onConnection(true, "")
-                r.playerApi.subscribeToPlayerState().setEventCallback { ps ->
-                    val t = ps.track
-                    host.onPlayer(!ps.isPaused && t != null, ps.playbackPosition, t?.duration ?: 1L,
-                        t?.name ?: "", t?.artist?.name ?: "", t?.album?.name ?: "", t?.uri)
-                    val img = t?.imageUri
-                    val raw = img?.raw
-                    if (img != null && raw != null && raw != lastImage) {
-                        lastImage = raw
-                        r.imagesApi.getImage(img, Image.Dimension.MEDIUM).setResultCallback { host.onArt(it) }
-                    } else if (img == null) { lastImage = null; host.onArt(null) }
-                }
-            }
-
-            override fun onFailure(error: Throwable) {
-                connecting = false
-                remote = null
-                val name = error.javaClass.simpleName
-                if (name.contains("UserNotAuthorized") || name.contains("Authentication")) token = null
-                host.onConnection(false, name + ": " + (error.message ?: ""))
-            }
-        })
-    }
-
-    override fun stop() {
-        remote?.let { SpotifyAppRemote.disconnect(it) }
-        remote = null
-        connecting = false
-    }
-
-    override fun onDeviceTap() { start() }
-    override fun play() { remote?.playerApi?.resume() }
-    override fun pause() { remote?.playerApi?.pause() }
-    override fun next() { remote?.playerApi?.skipNext() }
-    override fun prev() { remote?.playerApi?.skipPrevious() }
-    override fun seekTo(ms: Long) { remote?.playerApi?.seekTo(ms) }
-    override fun seekBy(ms: Long) { remote?.playerApi?.seekToRelativePosition(ms) }
-
-    override fun loadShelf() {
-        val r = remote ?: return
-        host.shelfStatus("Buscando lo último que escuchaste…")
-        // 1) historial exacto (Web API)
-        val tok = token
-        if (tok != null) Net.io.execute {
-            val list = recents(tok)
-            Net.post {
-                if (list.isNotEmpty()) host.shelfSection("Escuchado recientemente", list, true)
-            }
-        }
-        // 2) secciones que Spotify ofrece a la app
-        val call = r.contentApi.getRecommendedContentItems(ContentApi.ContentType.DEFAULT)
-        call.setErrorCallback { e -> host.shelfStatus("No se pudo leer: " + (e.message ?: "")) }
-        call.setResultCallback { top ->
-            val items = top.items ?: emptyArray()
-            val loose = items.filter { it.playable && !it.hasChildren }
-            if (loose.isNotEmpty()) host.shelfSection("Para ti", loose.map { entry(it) }, false)
-            for (sec in items.filter { it.hasChildren }) {
-                r.contentApi.getChildrenOfItem(sec, 20, 0).setResultCallback { kids ->
-                    val list = (kids.items ?: emptyArray()).filter { it.playable }
-                    if (list.isNotEmpty()) host.shelfSection(sec.title ?: "", list.map { entry(it) }, false)
-                }
-            }
-        }
-    }
-
-    private fun entry(it: ListItem) = ShelfEntry(it.title ?: "", it.subtitle ?: "", it) { cb ->
-        val img = it.imageUri
-        if (img != null) remote?.imagesApi?.getImage(img, Image.Dimension.SMALL)?.setResultCallback { b -> cb(b) }
-    }
-
-    private fun recents(tok: String): List<ShelfEntry> {
-        val js = Net.get("https://api.spotify.com/v1/me/player/recently-played?limit=50", tok) ?: return emptyList()
-        val items = try { JSONObject(js).optJSONArray("items") } catch (e: Exception) { null } ?: return emptyList()
-        val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
-        fmt.timeZone = TimeZone.getTimeZone("UTC")
-        val seen = LinkedHashSet<String>()
-        val out = ArrayList<ShelfEntry>()
-        for (i in 0 until items.length()) {
-            val it = items.optJSONObject(i) ?: continue
-            val track = it.optJSONObject("track") ?: continue
-            val ctx = it.optJSONObject("context")
-            val ctxUri = ctx?.optString("uri")?.takeIf { s -> s.isNotEmpty() }
-            val ctxType = ctx?.optString("type") ?: ""
-            val key = ctxUri ?: track.optString("uri")
-            if (key.isEmpty() || !seen.add(key)) continue
-            val playedAt = try { fmt.parse(it.optString("played_at").take(19))?.time ?: 0L } catch (e: Exception) { 0L }
-            val album = track.optJSONObject("album")
-            val imgs = album?.optJSONArray("images")
-            val imgUrl = imgs?.let { a -> (if (a.length() > 1) a.optJSONObject(1) else a.optJSONObject(0))?.optString("url") }
-            val artist = track.optJSONArray("artists")?.optJSONObject(0)?.optString("name") ?: ""
-            var title: String
-            val kind: String
-            var img = imgUrl
-            when (ctxType) {
-                "album" -> { title = album?.optString("name") ?: ""; kind = "Álbum" }
-                "playlist" -> {
-                    kind = "Playlist"
-                    title = "Playlist"
-                    val id = ctxUri?.substringAfterLast(":")
-                    val pj = if (id != null) Net.get("https://api.spotify.com/v1/playlists/$id?fields=name,images", tok) else null
-                    if (pj != null) try {
-                        val o = JSONObject(pj)
-                        title = o.optString("name", "Playlist")
-                        o.optJSONArray("images")?.optJSONObject(0)?.optString("url")?.let { u -> if (u.isNotEmpty()) img = u }
-                    } catch (e: Exception) {}
-                }
-                "artist" -> { title = artist; kind = "Artista" }
-                else -> { title = track.optString("name"); kind = "Canción" }
-            }
-            val sub = "$kind · " + (if (kind == "Artista") "" else "$artist · ") + Net.ago(playedAt)
-            val u = img
-            out.add(ShelfEntry(title, sub, key) { cb -> if (u != null) Net.image(u, cb) })
-            if (out.size >= 25) break
-        }
-        return out
-    }
-
-    override fun playEntry(e: ShelfEntry) {
-        val r = remote ?: return
-        when (val p = e.payload) {
-            is ListItem -> r.contentApi.playContentItem(p)
-            is String -> r.playerApi.play(p)
-        }
-    }
-
-    override fun setRepeat(on: Boolean) {
-        remote?.playerApi?.setRepeat(if (on) 2 else 0)
-    }
-}
-
-// =====================================================================
 // Universal: controla cualquier app de música con los controles de Android
 // =====================================================================
 class UniversalSource(private val host: SourceHost) : MusicSource {
@@ -320,8 +149,16 @@ class UniversalSource(private val host: SourceHost) : MusicSource {
 
     override fun onDeviceTap() {
         if (!hasAccess()) {
-            host.note("Activa \"Walkman UL\" en la lista y regresa a la app")
-            ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            val name = ctx.applicationInfo.loadLabel(ctx.packageManager).toString()
+            android.app.AlertDialog.Builder(ctx)
+                .setTitle("Controlar tu música")
+                .setMessage("Para mostrar la canción que suena y manejarla con los botones, $name necesita el permiso \"Acceso a notificaciones\" de Android.\n\nSolo se usa para leer el título, artista, portada y posición de la música, y para enviar play, pausa y cambio de canción. No se leen ni guardan tus otras notificaciones y nada sale de tu teléfono.")
+                .setPositiveButton("Ir a Ajustes") { _, _ ->
+                    host.note("Activa \"$name\" en la lista y regresa a la app")
+                    ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                }
+                .setNegativeButton("Ahora no", null)
+                .show()
         } else start()
     }
 
@@ -337,7 +174,7 @@ class UniversalSource(private val host: SourceHost) : MusicSource {
         controller?.unregisterCallback(cb)
         controller = c
         if (c == null) {
-            host.onConnection(false, "Abre tu app de música (Spotify, YouTube Music…) y pon algo")
+            host.onConnection(false, "Abre tu app de música y pon algo")
             host.onPlayer(false, 0, 1, "", "", "", null)
             return
         }
