@@ -105,7 +105,7 @@ class RadioSkin : Skin() {
         c.drawLine(dIn.left + dIn.width() * 0.05f, dIn.top + dIn.height() * 0.46f, dIn.right - dIn.width() * 0.05f, dIn.top + dIn.height() * 0.46f, p)
         text(c, lineOne(d), dIn.centerX(), dIn.top + dIn.height() * 0.68f, dIn.height() * 0.14f, col(0xFF2A1808), maxW = dIn.width() * 0.9f, tf = serif)
         text(c, lineTwo(d), dIn.centerX(), dIn.top + dIn.height() * 0.86f, dIn.height() * 0.11f, if (d.connected) col(0xFF5A3A18) else col(0xFFA02010), maxW = dIn.width() * 0.9f)
-        val nx = dIn.left + dIn.width() * (0.07f + 0.86f * d.progress())
+        val nx = dIn.left + dIn.width() * (0.07f + 0.86f * (if (preview >= 0f) preview else d.progress()))
         p.color = col(0xFFD02010); p.strokeWidth = H * 0.008f
         c.drawLine(nx, dIn.top + dIn.height() * 0.05f, nx, dIn.bottom - dIn.height() * 0.05f, p)
         // vidrio
@@ -115,9 +115,9 @@ class RadioSkin : Skin() {
         text(c, "Ulibertad", X(0.77f), Y(0.585f), H * 0.065f, col(0xFFE2C27A), tf = serif)
 
         knob(c, k1x, k1y, kr, -60f)
-        knob(c, k2x, k2y, kr, -140f + 280f * d.progress())
-        text(c, "◀ ESTACIÓN", k1x, k1y + kr * 1.55f, H * 0.035f, col(0xFFE2C27A))
-        text(c, "ESTACIÓN ▶", k2x, k2y + kr * 1.55f, H * 0.035f, col(0xFFE2C27A))
+        knob(c, k2x, k2y, kr, -140f + 280f * (if (preview >= 0f) preview else d.progress()))
+        text(c, "◀ ANTERIOR", k1x, k1y + kr * 1.55f, H * 0.035f, col(0xFFE2C27A))
+        text(c, "GIRA · SINTONÍA ▶", k2x, k2y + kr * 1.55f, H * 0.035f, col(0xFFE2C27A))
         // foco piloto
         p.color = if (d.connected) col(0xFFFFC04D) else col(0xFF5A3A1A)
         c.drawCircle(X(0.77f), Y(0.66f), H * 0.012f, p)
@@ -142,12 +142,35 @@ class RadioSkin : Skin() {
         p.strokeCap = Paint.Cap.BUTT
     }
 
+    private var knobDrag = false
+    private var knobLast = 0f
+    private var knobAcc = 0f
+    private var preview = -1f
+
     override fun touch(e: MotionEvent, d: Deck): Boolean {
-        if (e.actionMasked != MotionEvent.ACTION_DOWN) return true
-        if (hypot(e.x - k1x, e.y - k1y) < kr * 1.5f) { onSkip?.invoke(-1); return true }
-        if (hypot(e.x - k2x, e.y - k2y) < kr * 1.5f) { onSkip?.invoke(1); return true }
-        return false
+        val a = Math.toDegrees(kotlin.math.atan2((e.y - k2y).toDouble(), (e.x - k2x).toDouble())).toFloat()
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (hypot(e.x - k1x, e.y - k1y) < kr * 1.5f) { onSkip?.invoke(-1); return true }
+                if (hypot(e.x - k2x, e.y - k2y) < kr * 1.6f) { knobDrag = true; knobLast = a; knobAcc = 0f; return true }
+                return false
+            }
+            MotionEvent.ACTION_MOVE -> if (knobDrag) {
+                var da = a - knobLast
+                if (da > 180f) da -= 360f
+                if (da < -180f) da += 360f
+                knobLast = a; knobAcc += da
+                if (d.hasTrack) preview = (d.progress() + knobAcc / 300f).coerceIn(0f, 0.995f)
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (knobDrag) {
+                knobDrag = false
+                if (kotlin.math.abs(knobAcc) < 6f) onSkip?.invoke(1) else if (preview >= 0f) onSeek?.invoke(preview)
+                preview = -1f
+            }
+        }
+        return true
     }
+}
 }
 
 // =====================================================================

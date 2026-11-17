@@ -84,6 +84,38 @@ abstract class Skin {
 
     var onSeek: ((Float) -> Unit)? = null
     var onSkip: ((Int) -> Unit)? = null
+    var onSeekBy: ((Long) -> Unit)? = null
+
+    // ---------- giro con el dedo (estilo DJ) ----------
+    protected var scrubbing = false
+    private var scrubLast = 0f
+    private var scrubAcc = 0f
+    /** Grados que el dedo giró desde el último cuadro; el skin los suma a su ángulo y los pone en 0. */
+    protected var spinNudge = 0f
+
+    protected fun scrubTouch(e: MotionEvent, d: Deck, cx: Float, cy: Float, rad: Float): Boolean {
+        val a = Math.toDegrees(atan2((e.y - cy).toDouble(), (e.x - cx).toDouble())).toFloat()
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (!d.hasTrack || hypot(e.x - cx, e.y - cy) > rad) return false
+                scrubbing = true; scrubLast = a; scrubAcc = 0f
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> if (scrubbing) {
+                var da = a - scrubLast
+                if (da > 180f) da -= 360f
+                if (da < -180f) da += 360f
+                scrubLast = a; scrubAcc += da; spinNudge += da
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (scrubbing) {
+                scrubbing = false
+                if (kotlin.math.abs(scrubAcc) > 8f) onSeekBy?.invoke((scrubAcc / 360f * 8000f).toLong())
+                return true
+            }
+        }
+        return false
+    }
 
     fun layout(area: RectF) {
         var w = area.width()
@@ -469,7 +501,8 @@ class TurntableSkin : Skin() {
         }
         arm = ease(arm, target, dt, if (dragging) 30f else 4f)
         lift = ease(lift, if (d.isPlaying && !dragging && d.scanDir == 0) 0f else 1f, dt, 6f)
-        recAng += dt * 200f * d.spin
+        recAng += if (scrubbing) 0f else dt * 200f * d.spin
+        recAng += spinNudge; spinNudge = 0f
 
         // plinto de madera
         val plinth = Path(); plinth.addRoundRect(r, H * 0.04f, H * 0.04f, Path.Direction.CW)
@@ -569,15 +602,15 @@ class TurntableSkin : Skin() {
             MotionEvent.ACTION_DOWN -> {
                 if (!d.hasTrack) return false
                 val near = hypot(e.x - sx(arm), e.y - sy(arm)) < H * 0.16f
-                if (!near) return false
+                if (!near) return scrubTouch(e, d, cx, cy, recR)
                 dragging = true
                 dragAng = arm
                 return true
             }
-            MotionEvent.ACTION_MOVE -> if (dragging) {
+            MotionEvent.ACTION_MOVE -> if (scrubbing) return scrubTouch(e, d, cx, cy, recR) else if (dragging) {
                 dragAng = atan2(e.y - py, e.x - px).coerceIn(thRest, thInner)
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (dragging) {
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (scrubbing) return scrubTouch(e, d, cx, cy, recR) else if (dragging) {
                 dragging = false
                 if (dragAng >= thOuter - 0.02f) {
                     val rad = hypot(sx(dragAng) - cx, sy(dragAng) - cy)
@@ -607,7 +640,8 @@ class DiscmanSkin : Skin() {
 
     override fun draw(c: Canvas, d: Deck, dt: Float, now: Long) {
         reset()
-        ang += dt * 540f * d.spin
+        ang += if (scrubbing) 0f else dt * 540f * d.spin
+        ang += spinNudge; spinNudge = 0f
         val body = RectF(r)
         p.color = col(0xFF000000)
         p.setShadowLayer(H * 0.05f, 0f, H * 0.02f, col(0xCC000000))
@@ -685,4 +719,6 @@ class DiscmanSkin : Skin() {
         grad(c, RectF(X(0.80f), Y(0.08f), X(0.92f), Y(0.13f)), H * 0.02f, col(0xFFE0E3E8), col(0xFF9AA1AB))
         text(c, "OPEN", X(0.86f), Y(0.118f), H * 0.03f, col(0xFF3A3F47))
     }
+
+    override fun touch(e: MotionEvent, d: Deck): Boolean = scrubTouch(e, d, X(0.5f), Y(0.44f), W * 0.38f)
 }

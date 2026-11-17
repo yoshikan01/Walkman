@@ -37,6 +37,8 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         fun onOpenShelf()
         fun onToggleMute()
         fun onToggleAmbient()
+        fun onSeekBy(ms: Long)
+        fun onTimerMenu()
     }
 
     var listener: Listener? = null
@@ -45,10 +47,19 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         set(v) { field = (v + skins.size) % skins.size; relayout() }
     var muted = false
     var ambientOn = false
+    var meter: AudioMeter? = null
+    /** Texto del temporizador (null = apagado). */
+    var sleepLabel: String? = null
+    private var prevSkin: Skin? = null
+    private var trans = 1f
+    private var devDown = false
+    private var downX = 0f
+    private var downY = 0f
+    private var swipeOff = 0f
 
     private val dp = resources.displayMetrics.density
     private val btnPrev = RectF(); private val btnName = RectF(); private val btnNext = RectF()
-    private val btnShelf = RectF(); private val btnAmb = RectF(); private val btnSnd = RectF()
+    private val btnShelf = RectF(); private val btnAmb = RectF(); private val btnSnd = RectF(); private val btnTimer = RectF()
     private var compact = false
     private val info = RectF()
     private val device = RectF()
@@ -81,10 +92,19 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         for (s in skins) {
             s.onSeek = { f -> listener?.onSeek(f) }
             s.onSkip = { dir -> listener?.onSkip(dir) }
+            s.onSeekBy = { ms -> listener?.onSeekBy(ms) }
         }
     }
 
     fun skin() = skins[skinIndex]
+
+    /** Cambia de aparato con animación: el anterior sale hacia arriba y el nuevo cae en su lugar. */
+    fun switchSkin(i: Int) {
+        if ((i + skins.size) % skins.size == skinIndex) return
+        prevSkin = skin()
+        trans = 0f
+        skinIndex = i
+    }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
@@ -95,7 +115,7 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         val w = width.toFloat(); val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
         val portrait = h > w
-        compact = w < 560 * dp
+        compact = w < 720 * dp
 
         // barra superior
         val topH = 44 * dp
@@ -107,10 +127,11 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         val nameW = (tp.measureText(skin().name.uppercase()) + 24 * dp).coerceAtMost(w * 0.42f)
         btnName.set(btnPrev.right + 4 * dp, by, btnPrev.right + 4 * dp + nameW, by + bh)
         btnNext.set(btnName.right + 4 * dp, by, btnName.right + 4 * dp + bh, by + bh)
-        val pillW = if (compact) bh else 112 * dp
+        val pillW = if (compact) bh else 104 * dp
         btnSnd.set(w - pad - pillW, by, w - pad, by + bh)
         btnAmb.set(btnSnd.left - 6 * dp - pillW, by, btnSnd.left - 6 * dp, by + bh)
         btnShelf.set(btnAmb.left - 6 * dp - pillW, by, btnAmb.left - 6 * dp, by + bh)
+        btnTimer.set(btnShelf.left - 6 * dp - pillW, by, btnShelf.left - 6 * dp, by + bh)
 
         // teclas
         keyH = if (portrait) min(h * 0.11f, w * 0.26f) else h * 0.17f
@@ -150,7 +171,32 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         c.drawRect(0f, 0f, w, h, p)
         p.shader = null
 
-        s.draw(c, deck, dt, now)
+        val prev = prevSkin
+        if (trans < 1f && prev != null) {
+            trans = min(1f, trans + dt / 0.65f)
+            val t = trans
+            val up = t * t
+            c.save()
+            c.translate(0f, -up * (device.bottom))
+            c.saveLayerAlpha(0f, 0f, w, h, ((1f - t) * 255).toInt())
+            prev.draw(c, deck, dt, now)
+            c.restore()
+            c.restore()
+            // el nuevo cae desde arriba con un pequeño rebote
+            val k = 1f - (1f - t) * (1f - t) * (1f - t)
+            val bounce = if (t > 0.75f) kotlin.math.sin((t - 0.75f) / 0.25f * Math.PI.toFloat()) * 0.04f else 0f
+            c.save()
+            c.translate(0f, -(1f - k) * device.bottom + bounce * device.height())
+            s.draw(c, deck, dt, now)
+            c.restore()
+            if (trans >= 1f) prevSkin = null
+        } else {
+            c.save()
+            c.translate(swipeOff * 0.35f, 0f)
+            s.draw(c, deck, dt, now)
+            c.restore()
+            if (!devDown) swipeOff *= 0.8f
+        }
         drawTopBar(c)
         drawInfo(c)
         drawKeys(c, dt)
@@ -165,6 +211,14 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
             else -> 0f
         }
         d.spin += (target - d.spin) * min(1f, dt * 3f)
+        val m = meter
+        if (d.isPlaying && m != null && m.alive()) {
+            d.level += (m.level - d.level) * min(1f, dt * 18f)
+            d.levelL += (m.levelL - d.levelL) * min(1f, dt * 14f)
+            d.levelR += (m.levelR - d.levelR) * min(1f, dt * 14f)
+            for (i in d.bands.indices) d.bands[i] += (m.bands[i] - d.bands[i]) * min(1f, dt * 16f)
+            return
+        }
         if (d.isPlaying) {
             val ph = (now % 500L) / 500f
             val kick = exp(-ph * 6f)
@@ -199,6 +253,12 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         iconLabel(c, btnShelf, 0, "RECIENTES")
         iconLabel(c, btnAmb, 1, "AMBIENTE")
         iconLabel(c, btnSnd, if (muted) 3 else 2, if (muted) "SIN SONIDO" else "SONIDOS")
+        val sl = sleepLabel
+        pill(c, btnTimer, sl != null)
+        if (sl != null && compact) {
+            tp.typeface = condensed; tp.textAlign = Paint.Align.CENTER; tp.textSize = 11 * dp; tp.color = 0xFFFFFFFF.toInt()
+            c.drawText(sl.take(5), btnTimer.centerX(), btnTimer.centerY() + tp.textSize * 0.36f, tp)
+        } else iconLabel(c, btnTimer, 4, sl ?: "DORMIR")
     }
 
     private fun arrow(c: Canvas, r: RectF, dir: Int) {
@@ -219,6 +279,11 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
         p.style = Paint.Style.STROKE; p.strokeWidth = 2 * dp; p.strokeCap = Paint.Cap.ROUND
         when (icon) {
             0 -> for (k in -1..1) c.drawLine(ix - s, iy + k * s * 0.7f, ix + s, iy + k * s * 0.7f, p)
+            4 -> {
+                c.drawCircle(ix, iy, s, p)
+                c.drawLine(ix, iy, ix, iy - s * 0.6f, p)
+                c.drawLine(ix, iy, ix + s * 0.45f, iy + s * 0.2f, p)
+            }
             1 -> {
                 val wp = Path()
                 for (k in 0..1) {
@@ -376,19 +441,35 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
                     btnShelf.contains(x, y) -> { tapFx(); listener?.onOpenShelf(); return true }
                     btnAmb.contains(x, y) -> { tapFx(); listener?.onToggleAmbient(); return true }
                     btnSnd.contains(x, y) -> { tapFx(); listener?.onToggleMute(); return true }
+                    btnTimer.contains(x, y) -> { tapFx(); listener?.onTimerMenu(); return true }
                 }
                 for (i in 0 until 5) if (keyHit[i].contains(x, y)) { pressKey(i); return true }
                 val s = skin()
                 if (s.r.contains(x, y)) {
                     if (deck.connected && s.touch(e, deck)) { skinTouch = true; return true }
-                    listener?.onDeviceTap()
+                    devDown = true; downX = x; downY = y; swipeOff = 0f
                     return true
                 }
                 return false
             }
-            MotionEvent.ACTION_MOVE -> if (skinTouch) skin().touch(e, deck)
+            MotionEvent.ACTION_MOVE -> {
+                if (skinTouch) skin().touch(e, deck)
+                else if (devDown) swipeOff = x - downX
+            }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (skinTouch) { skin().touch(e, deck); skinTouch = false }
+                if (devDown) {
+                    devDown = false
+                    val dx = x - downX; val dy = y - downY
+                    if (e.actionMasked == MotionEvent.ACTION_UP) {
+                        if (kotlin.math.abs(dx) > device.width() * 0.18f && kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.5f) {
+                            tapFx()
+                            listener?.onSkip(if (dx < 0) 1 else -1)
+                        } else if (kotlin.math.abs(dx) < 14 * dp && kotlin.math.abs(dy) < 14 * dp) {
+                            listener?.onDeviceTap()
+                        }
+                    }
+                }
                 if (pressedKey >= 0) releaseKey(e.actionMasked == MotionEvent.ACTION_UP)
             }
         }
@@ -399,7 +480,7 @@ class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
 
     private fun changeSkin(dir: Int) {
         tapFx()
-        skinIndex += dir
+        switchSkin(skinIndex + dir)
         listener?.onSkinChanged(skinIndex)
     }
 

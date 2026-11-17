@@ -1,16 +1,17 @@
 package com.yoshikan.walkman
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
-import android.graphics.Shader
 import android.graphics.SweepGradient
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -18,6 +19,7 @@ import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -29,43 +31,44 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
-import com.spotify.android.appremote.api.ConnectionParams
-import com.spotify.android.appremote.api.Connector
-import com.spotify.android.appremote.api.ContentApi
-import com.spotify.android.appremote.api.SpotifyAppRemote
-import com.spotify.protocol.types.Image
-import com.spotify.protocol.types.ListItem
-import com.spotify.protocol.types.PlayerState
 import com.spotify.sdk.android.auth.AuthorizationClient
 import com.spotify.sdk.android.auth.AuthorizationRequest
 import com.spotify.sdk.android.auth.AuthorizationResponse
 
-class MainActivity : Activity(), WalkmanView.Listener {
+class MainActivity : Activity(), WalkmanView.Listener, SourceHost {
 
     companion object {
-        const val CLIENT_ID = "1d4f1c05d332459b8ff8cd74e247cf9a"
-        const val REDIRECT_URI = "walkmanul://callback"
         const val AUTH_REQ = 1337
+        const val MIC_REQ = 7
     }
 
-    private var remote: SpotifyAppRemote? = null
-    private var connecting = false
-    private var authorized = false
-    private var authInFlight = false
+    override val ctx: Activity get() = this
+
     private lateinit var walkman: WalkmanView
     private lateinit var prefs: SharedPreferences
     private lateinit var sounds: Sounds
-    private lateinit var audio: AudioManager
+    private val meter = AudioMeter()
     private val handler = Handler(Looper.getMainLooper())
-    private var lastImageUri: String? = null
-    private var lastTrackUri: String? = null
+    private lateinit var spotify: SpotifySource
+    private lateinit var universal: UniversalSource
+    private lateinit var source: MusicSource
+    private var authInFlight = false
+    private var lastTrack: String? = null
     private var scanDir = 0
+    private var sleepAt = 0L
+    private var sleepEndOfTrack = false
     private val scanRunnable = object : Runnable {
         override fun run() {
             if (scanDir != 0) {
-                remote?.playerApi?.seekToRelativePosition(scanDir * 6000L)
+                source.seekBy(scanDir * 6000L)
                 handler.postDelayed(this, 350)
             }
+        }
+    }
+    private val ticker = object : Runnable {
+        override fun run() {
+            tickSleep()
+            handler.postDelayed(this, 1000)
         }
     }
 
@@ -74,28 +77,28 @@ class MainActivity : Activity(), WalkmanView.Listener {
     private lateinit var shelfTitle: TextView
     private lateinit var shelfStatus: TextView
     private lateinit var shelfAdapter: ShelfAdapter
-    private val rows = mutableListOf<Row>()
-    private val thumbs = HashMap<String, Bitmap>()
-
-    private sealed class Row {
-        class Header(val title: String) : Row()
-        class Item(val item: ListItem) : Row()
-    }
+    private val rows = mutableListOf<Any>()   // String = encabezado, ShelfEntry = elemento
+    private val thumbs = HashMap<ShelfEntry, Bitmap>()
 
     private val d get() = walkman.deck
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         volumeControlStream = AudioManager.STREAM_MUSIC
         prefs = getSharedPreferences("walkman", Context.MODE_PRIVATE)
         sounds = Sounds(this)
+
+        spotify = SpotifySource(this)
+        spotify.needAuth = { startAuth() }
+        universal = UniversalSource(this)
+        source = if (prefs.getString("source", "spotify") == "universal") universal else spotify
 
         val root = FrameLayout(this)
         root.setBackgroundColor(col(0xFF0D0E10))
         walkman = WalkmanView(this, allSkins())
         walkman.listener = this
+        walkman.meter = meter
         walkman.skinIndex = prefs.getInt("skin", 0)
         walkman.muted = prefs.getBoolean("muted", false)
         walkman.ambientOn = prefs.getBoolean("ambient", false)
@@ -126,17 +129,18 @@ class MainActivity : Activity(), WalkmanView.Listener {
 
     override fun onStart() {
         super.onStart()
-        connect()
+        source.start()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) meter.start()
+        handler.post(ticker)
     }
 
     override fun onStop() {
         super.onStop()
-        scanDir = 0
-        sounds.stopScan()
+        onScanEnd()
         sounds.stopAmbient()
-        remote?.let { SpotifyAppRemote.disconnect(it) }
-        remote = null
-        connecting = false
+        source.stop()
+        meter.stop()
+        handler.removeCallbacks(ticker)
         d.connected = false
     }
 
@@ -145,54 +149,54 @@ class MainActivity : Activity(), WalkmanView.Listener {
         sounds.release()
     }
 
-    // ================= Spotify =================
+    // ================= SourceHost =================
 
-    private fun connect() {
-        if (!authorized) { startAuth(); return }
-        if (remote != null || connecting) return
-        if (!SpotifyAppRemote.isSpotifyInstalled(this)) {
-            d.status = "Instala la app de Spotify en este teléfono"
-            return
+    override fun onPlayer(playing: Boolean, posMs: Long, durMs: Long, title: String, artist: String, album: String, trackKey: String?) {
+        if (trackKey != null && trackKey != lastTrack) {
+            if (lastTrack != null && sleepEndOfTrack) { lastTrack = trackKey; doSleep(); return }
+            lastTrack = trackKey
+            d.trackNo++
         }
-        connecting = true
-        d.status = "Conectando con Spotify…"
-        val params = ConnectionParams.Builder(CLIENT_ID)
-            .setRedirectUri(REDIRECT_URI)
-            .showAuthView(false)
-            .build()
-        SpotifyAppRemote.connect(this, params, object : Connector.ConnectionListener {
-            override fun onConnected(appRemote: SpotifyAppRemote) {
-                connecting = false
-                remote = appRemote
-                d.connected = true
-                d.status = ""
-                appRemote.playerApi.subscribeToPlayerState().setEventCallback { onPlayerState(it) }
-            }
-
-            override fun onFailure(error: Throwable) {
-                connecting = false
-                remote = null
-                d.connected = false
-                val name = error.javaClass.simpleName
-                val detail = name + ": " + (error.message ?: "")
-                d.status = when {
-                    name.contains("NotLoggedIn") -> "Inicia sesión en la app de Spotify · $detail"
-                    name.contains("UserNotAuthorized") || name.contains("Authentication") -> { authorized = false; "Falta autorizar · $detail" }
-                    name.contains("CouldNotFindSpotifyApp") -> "Instala la app de Spotify"
-                    name.contains("OfflineMode") -> "Spotify está sin conexión"
-                    else -> detail
-                }
-                toast(d.status)
-            }
-        })
+        d.isPlaying = playing
+        d.basePosMs = posMs
+        d.baseTime = SystemClock.uptimeMillis()
+        d.durationMs = if (durMs > 0) durMs else 1L
+        d.title = title
+        d.artist = artist
+        d.album = album
+        d.hasTrack = title.isNotEmpty()
+        updateAmbient()
+        if (playing) askMicOnce()
     }
+
+    override fun onArt(bmp: Bitmap?) { d.art = bmp }
+
+    override fun onConnection(connected: Boolean, status: String) {
+        d.connected = connected
+        d.status = status
+    }
+
+    override fun shelfSection(title: String, entries: List<ShelfEntry>, first: Boolean) {
+        val block = mutableListOf<Any>(title)
+        block.addAll(entries)
+        if (first) rows.addAll(0, block) else rows.addAll(block)
+        shelfStatus.text = "${rows.count { it is ShelfEntry }} opciones · toca una para ponerla"
+        shelfAdapter.notifyDataSetChanged()
+        for (e in entries) e.image { b -> thumbs[e] = b; shelfAdapter.notifyDataSetChanged() }
+    }
+
+    override fun shelfStatus(s: String) { shelfStatus.text = s }
+
+    override fun note(s: String) { toast(s) }
+
+    // ================= Spotify auth =================
 
     private fun startAuth() {
         if (authInFlight) return
         authInFlight = true
         d.status = "Pidiendo permiso a Spotify…"
-        val req = AuthorizationRequest.Builder(CLIENT_ID, AuthorizationResponse.Type.TOKEN, REDIRECT_URI)
-            .setScopes(arrayOf("app-remote-control", "streaming", "user-read-playback-state", "user-modify-playback-state", "user-read-recently-played"))
+        val req = AuthorizationRequest.Builder(SpotifySource.CLIENT_ID, AuthorizationResponse.Type.TOKEN, SpotifySource.REDIRECT_URI)
+            .setScopes(arrayOf("app-remote-control", "streaming", "user-read-playback-state", "user-modify-playback-state", "user-read-recently-played", "playlist-read-private"))
             .setShowDialog(false)
             .build()
         AuthorizationClient.openLoginActivity(this, AUTH_REQ, req)
@@ -205,92 +209,71 @@ class MainActivity : Activity(), WalkmanView.Listener {
         authInFlight = false
         val resp = AuthorizationClient.getResponse(resultCode, data)
         when (resp.type) {
-            AuthorizationResponse.Type.TOKEN -> { authorized = true; connect() }
-            AuthorizationResponse.Type.ERROR -> {
-                d.status = "Spotify rechazó el acceso: " + resp.error
-                toast(d.status)
-            }
+            AuthorizationResponse.Type.TOKEN -> { spotify.token = resp.accessToken; if (source === spotify) spotify.start() }
+            AuthorizationResponse.Type.ERROR -> { d.status = "Spotify rechazó el acceso: " + resp.error; toast(d.status) }
             else -> d.status = "Autorización cancelada · toca el aparato"
         }
     }
 
-    private fun onPlayerState(ps: PlayerState) {
-        val track = ps.track
-        val uri = track?.uri
-        if (uri != null && uri != lastTrackUri) { lastTrackUri = uri; d.trackNo++ }
-        d.isPlaying = !ps.isPaused && track != null
-        d.basePosMs = ps.playbackPosition
-        d.baseTime = android.os.SystemClock.uptimeMillis()
-        d.durationMs = if ((track?.duration ?: 0L) > 0L) track!!.duration else 1L
-        d.title = track?.name ?: ""
-        d.artist = track?.artist?.name ?: ""
-        d.album = track?.album?.name ?: ""
-        d.hasTrack = d.title.isNotEmpty()
-        updateAmbient()
-        val img = track?.imageUri
-        val raw = img?.raw
-        if (img != null && raw != null && raw != lastImageUri) {
-            lastImageUri = raw
-            remote?.imagesApi?.getImage(img, Image.Dimension.MEDIUM)?.setResultCallback { bmp -> d.art = bmp }
-        } else if (img == null) {
-            lastImageUri = null
-            d.art = null
+    // ================= micrófono para niveles reales =================
+
+    private fun askMicOnce() {
+        if (meter.running) return
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { meter.start(); return }
+        if (prefs.getBoolean("askedMic", false)) return
+        prefs.edit().putBoolean("askedMic", true).apply()
+        AlertDialog.Builder(this)
+            .setTitle("Vúmetros de verdad")
+            .setMessage("Para que las agujas, bocinas y ecualizador se muevan con tu música, Android pide el permiso de micrófono. La app no graba nada: solo mide el volumen de lo que suena.")
+            .setPositiveButton("Permitir") { _, _ -> requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), MIC_REQ) }
+            .setNegativeButton("Ahora no", null)
+            .show()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MIC_REQ && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            if (!meter.start()) toast("Este teléfono no deja leer el audio; se usa la animación")
         }
-    }
-
-    private fun needRemote(): SpotifyAppRemote? {
-        val r = remote
-        if (r == null) { toast("Conectando con Spotify…"); connect() }
-        return r
-    }
-
-    private fun updateAmbient() {
-        sounds.setAmbient(walkman.skin().ambient, walkman.ambientOn && d.isPlaying)
     }
 
     // ================= Teclas y controles =================
 
+    private fun ready(): Boolean {
+        if (!source.connected) { source.onDeviceTap(); return false }
+        return true
+    }
+
     override fun onPlayKey() {
-        val r = needRemote() ?: return
+        if (!ready()) return
         if (d.hasTrack) {
             if (!d.isPlaying) sounds.play(Sounds.Ev.PLAY)
             d.isPlaying = true
-            r.playerApi.resume()
+            source.play()
         } else openShelf()
     }
 
     override fun onPauseKey() {
-        val r = needRemote() ?: return
-        if (d.isPlaying) {
-            sounds.play(Sounds.Ev.PAUSE)
-            d.isPlaying = false
-            r.playerApi.pause()
-        } else if (d.hasTrack) {
-            sounds.play(Sounds.Ev.PLAY)
-            d.isPlaying = true
-            r.playerApi.resume()
-        }
+        if (!ready()) return
+        if (d.isPlaying) { sounds.play(Sounds.Ev.PAUSE); d.isPlaying = false; source.pause() }
+        else if (d.hasTrack) { sounds.play(Sounds.Ev.PLAY); d.isPlaying = true; source.play() }
         updateAmbient()
     }
 
     override fun onStopEjectKey() {
-        val r = needRemote() ?: return
-        if (d.isPlaying) {
-            sounds.play(Sounds.Ev.STOP)
-            d.isPlaying = false
-            r.playerApi.pause()
-            updateAmbient()
-        } else openShelf()
+        if (!ready()) return
+        if (d.isPlaying) { sounds.play(Sounds.Ev.STOP); d.isPlaying = false; source.pause(); updateAmbient() }
+        else openShelf()
     }
 
     override fun onSkip(dir: Int) {
-        val r = needRemote() ?: return
+        if (!ready()) return
         sounds.play(if (dir > 0) Sounds.Ev.NEXT else Sounds.Ev.PREV)
-        if (dir > 0) r.playerApi.skipNext() else r.playerApi.skipPrevious()
+        if (dir > 0) source.next() else source.prev()
     }
 
     override fun onScanStart(dir: Int) {
-        if (needRemote() == null) return
+        if (!source.connected) return
         scanDir = dir
         sounds.startScan()
         handler.removeCallbacks(scanRunnable)
@@ -304,17 +287,24 @@ class MainActivity : Activity(), WalkmanView.Listener {
     }
 
     override fun onDeviceTap() {
-        if (remote == null) connect() else if (!d.hasTrack) openShelf()
+        if (!source.connected) source.onDeviceTap() else if (!d.hasTrack) openShelf()
     }
 
     override fun onSeek(fraction: Float) {
-        val r = needRemote() ?: return
+        if (!ready()) return
         val ms = (d.durationMs * fraction).toLong()
         d.basePosMs = ms
-        d.baseTime = android.os.SystemClock.uptimeMillis()
+        d.baseTime = SystemClock.uptimeMillis()
         sounds.play(Sounds.Ev.PLAY)
-        r.playerApi.seekTo(ms)
-        if (!d.isPlaying) r.playerApi.resume()
+        source.seekTo(ms)
+        if (!d.isPlaying) source.play()
+    }
+
+    override fun onSeekBy(ms: Long) {
+        if (!ready()) return
+        d.basePosMs = (d.pos() + ms).coerceIn(0L, d.durationMs)
+        d.baseTime = SystemClock.uptimeMillis()
+        source.seekBy(ms)
     }
 
     override fun onKeySound(down: Boolean) {
@@ -326,19 +316,32 @@ class MainActivity : Activity(), WalkmanView.Listener {
         sounds.kind = walkman.skin().kind
         sounds.stopAmbient()
         updateAmbient()
-        sounds.play(Sounds.Ev.SWITCH)
+        sounds.play(Sounds.Ev.EJECT)
     }
 
     override fun onSkinMenu() {
         val names = walkman.skins.map { it.name }.toTypedArray()
+        val other = if (source === spotify) "Universal (cualquier app)" else "Spotify"
         AlertDialog.Builder(this)
             .setTitle("Elige tu aparato")
             .setSingleChoiceItems(names, walkman.skinIndex) { dlg, which ->
-                walkman.skinIndex = which
+                walkman.switchSkin(which)
                 onSkinChanged(which)
                 dlg.dismiss()
             }
+            .setNeutralButton("Fuente: ${source.label} → $other") { _, _ -> switchSource() }
             .show()
+    }
+
+    private fun switchSource() {
+        source.stop()
+        source = if (source === spotify) universal else spotify
+        prefs.edit().putString("source", if (source === universal) "universal" else "spotify").apply()
+        lastTrack = null
+        d.hasTrack = false; d.isPlaying = false; d.art = null; d.connected = false
+        updateAmbient()
+        toast(if (source === universal) "Fuente universal: controla Spotify, YouTube Music, Apple Music o cualquier app" else "Fuente: Spotify")
+        source.start()
     }
 
     override fun onOpenShelf() { openShelf() }
@@ -362,6 +365,49 @@ class MainActivity : Activity(), WalkmanView.Listener {
             Ambient.HUM -> "zumbido de bulbos"
         }
         toast(if (walkman.ambientOn) "Ambiente encendido ($what)" else "Ambiente apagado")
+    }
+
+    private fun updateAmbient() {
+        sounds.setAmbient(walkman.skin().ambient, walkman.ambientOn && d.isPlaying)
+    }
+
+    // ================= Temporizador para dormir =================
+
+    override fun onTimerMenu() {
+        val opts = arrayOf("Apagado", "15 minutos", "30 minutos", "45 minutos", "60 minutos", "90 minutos", "Al terminar esta canción")
+        val mins = intArrayOf(0, 15, 30, 45, 60, 90, -1)
+        AlertDialog.Builder(this)
+            .setTitle("Apagar la música en…")
+            .setItems(opts) { _, i ->
+                sleepEndOfTrack = mins[i] == -1
+                sleepAt = if (mins[i] > 0) SystemClock.uptimeMillis() + mins[i] * 60_000L else 0L
+                sounds.play(Sounds.Ev.SWITCH)
+                tickSleep()
+                toast(if (i == 0) "Temporizador apagado" else "La música se detendrá: " + opts[i].lowercase())
+            }
+            .show()
+    }
+
+    private fun tickSleep() {
+        walkman.sleepLabel = when {
+            sleepEndOfTrack -> "FIN CANCIÓN"
+            sleepAt > 0L -> {
+                val left = (sleepAt - SystemClock.uptimeMillis()).coerceAtLeast(0L) / 1000
+                if (left == 0L) { doSleep(); null } else "%d:%02d".format(left / 60, left % 60)
+            }
+            else -> null
+        }
+    }
+
+    private fun doSleep() {
+        sleepAt = 0L
+        sleepEndOfTrack = false
+        walkman.sleepLabel = null
+        if (source.connected) source.pause()
+        d.isPlaying = false
+        sounds.play(Sounds.Ev.STOP)
+        updateAmbient()
+        toast("Temporizador: música en pausa. Buenas noches.")
     }
 
     @Deprecated("Deprecated in Java")
@@ -398,7 +444,11 @@ class MainActivity : Activity(), WalkmanView.Listener {
         list.adapter = shelfAdapter
         list.setOnItemClickListener { _, _, pos, _ ->
             val row = rows[pos]
-            if (row is Row.Item) playItem(row.item)
+            if (row is ShelfEntry) {
+                source.playEntry(row)
+                sounds.play(Sounds.Ev.PLAY)
+                closeShelf()
+            }
         }
         box.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
@@ -409,64 +459,18 @@ class MainActivity : Activity(), WalkmanView.Listener {
         return box
     }
 
-    private fun isRecent(title: String?): Boolean {
-        val t = (title ?: "").lowercase()
-        return t.contains("recien") || t.contains("recent") || t.contains("escuchad") || t.contains("reproducid") || t.contains("jump back") || t.contains("volver a escuchar")
-    }
-
     private fun openShelf() {
-        val r = remote ?: run { connect(); return }
+        if (!source.connected) { source.onDeviceTap(); return }
         val s = walkman.skin()
         sounds.play(Sounds.Ev.EJECT)
         shelf.setBackgroundColor(s.shelfBg)
-        shelfTitle.text = s.shelfTitle
+        shelfTitle.text = s.shelfTitle + " · " + source.label.uppercase()
         shelf.visibility = View.VISIBLE
         rows.clear()
+        thumbs.clear()
         shelfAdapter.notifyDataSetChanged()
         shelfStatus.text = "Buscando lo último que escuchaste…"
-        val call = r.contentApi.getRecommendedContentItems(ContentApi.ContentType.DEFAULT)
-        call.setErrorCallback { e -> shelfStatus.text = "No se pudo leer: " + (e.message ?: "") }
-        call.setResultCallback { top ->
-            val items = top.items ?: emptyArray()
-            if (items.isEmpty()) shelfStatus.text = "Spotify no devolvió nada. Pon algo en Spotify y vuelve a intentar."
-            val loose = items.filter { it.playable && !it.hasChildren }
-            if (loose.isNotEmpty()) addSection("Para ti", loose, false)
-            for (sec in items.filter { it.hasChildren }) {
-                r.contentApi.getChildrenOfItem(sec, 20, 0).setResultCallback { kids ->
-                    val list = (kids.items ?: emptyArray()).filter { it.playable }
-                    if (list.isNotEmpty()) addSection(sec.title ?: "", list, isRecent(sec.title))
-                }
-            }
-        }
-    }
-
-    private fun addSection(title: String, items: List<ListItem>, recent: Boolean) {
-        val block = mutableListOf<Row>()
-        block.add(Row.Header(if (recent) "▶  Escuchado recientemente" else title))
-        for (it in items) block.add(Row.Item(it))
-        if (recent) rows.addAll(0, block) else rows.addAll(block)
-        val count = rows.count { it is Row.Item }
-        shelfStatus.text = "$count opciones · toca una para ponerla"
-        shelfAdapter.notifyDataSetChanged()
-        for (it in items) loadThumb(it)
-    }
-
-    private fun loadThumb(item: ListItem) {
-        val img = item.imageUri ?: return
-        val key = img.raw ?: return
-        if (thumbs.containsKey(key)) return
-        remote?.imagesApi?.getImage(img, Image.Dimension.SMALL)?.setResultCallback { bmp ->
-            thumbs[key] = bmp
-            shelfAdapter.notifyDataSetChanged()
-        }
-    }
-
-    private fun playItem(item: ListItem) {
-        val r = remote ?: return
-        r.contentApi.playContentItem(item)
-        sounds.play(Sounds.Ev.PLAY)
-        d.isPlaying = true
-        closeShelf()
+        source.loadShelf()
     }
 
     private fun closeShelf() {
@@ -476,8 +480,7 @@ class MainActivity : Activity(), WalkmanView.Listener {
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
-    // miniatura con forma según el aparato
-    private inner class ThumbView(ctx: Context) : View(ctx) {
+    private inner class ThumbView(c0: Context) : View(c0) {
         var bmp: Bitmap? = null
         var shape = 0
         private val p = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
@@ -535,22 +538,22 @@ class MainActivity : Activity(), WalkmanView.Listener {
         override fun getItem(position: Int): Any = rows[position]
         override fun getItemId(position: Int) = position.toLong()
         override fun getViewTypeCount() = 2
-        override fun getItemViewType(position: Int) = if (rows[position] is Row.Header) 0 else 1
-        override fun isEnabled(position: Int) = rows[position] is Row.Item
+        override fun getItemViewType(position: Int) = if (rows[position] is String) 0 else 1
+        override fun isEnabled(position: Int) = rows[position] is ShelfEntry
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
             val dp = resources.displayMetrics.density
             val row = rows[position]
-            if (row is Row.Header) {
+            if (row is String) {
                 val t = TextView(this@MainActivity)
-                t.text = row.title.uppercase()
+                t.text = (if (row.startsWith("Escuchado")) "▶  " else "") + row.uppercase()
                 t.setTextColor(walkman.skin().accent)
                 t.textSize = 15f
                 t.typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
                 t.setPadding(0, (14 * dp).toInt(), 0, (4 * dp).toInt())
                 return t
             }
-            val item = (row as Row.Item).item
+            val item = row as ShelfEntry
             val box = LinearLayout(this@MainActivity)
             box.orientation = LinearLayout.HORIZONTAL
             box.gravity = Gravity.CENTER_VERTICAL
@@ -562,21 +565,21 @@ class MainActivity : Activity(), WalkmanView.Listener {
 
             val th = ThumbView(this@MainActivity)
             th.shape = walkman.skin().thumbShape
-            th.bmp = item.imageUri?.raw?.let { thumbs[it] }
+            th.bmp = thumbs[item]
             box.addView(th, LinearLayout.LayoutParams((60 * dp).toInt(), (60 * dp).toInt()))
 
             val texts = LinearLayout(this@MainActivity)
             texts.orientation = LinearLayout.VERTICAL
             texts.setPadding((12 * dp).toInt(), 0, 0, 0)
             val t = TextView(this@MainActivity)
-            t.text = item.title ?: ""
+            t.text = item.title
             t.setTextColor(col(0xFFF3E9D2))
             t.textSize = 16f
             t.typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
             t.maxLines = 1
             texts.addView(t)
             val s = TextView(this@MainActivity)
-            s.text = item.subtitle ?: ""
+            s.text = item.subtitle
             s.setTextColor(col(0xFFA89E8A))
             s.textSize = 13f
             s.maxLines = 1
@@ -585,7 +588,4 @@ class MainActivity : Activity(), WalkmanView.Listener {
             return box
         }
     }
-
-    @Suppress("unused")
-    private val keepShader: Shader? = null
 }
