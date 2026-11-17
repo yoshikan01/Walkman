@@ -11,8 +11,9 @@ android {
         applicationId 'com.yoshikan.walkman'
         minSdk 24
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        versionCode 2
+        versionName '1.1'
+        manifestPlaceholders = [redirectSchemeName: 'walkmanul', redirectHostName: 'callback', redirectPathPattern: '.*']
     }
 
     signingConfigs {
@@ -44,4 +45,5 @@ android {
 dependencies {
     implementation fileTree(dir: 'libs', include: ['*.aar'])
     implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'com.spotify.android:auth:2.1.1'
 }

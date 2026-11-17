@@ -2,6 +2,7 @@ package com.yoshikan.walkman
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -30,6 +31,9 @@ import com.spotify.protocol.types.Image
 import com.spotify.protocol.types.ListItem
 import com.spotify.protocol.types.PlayerState
 import com.spotify.protocol.types.Repeat
+import com.spotify.sdk.android.auth.AuthorizationClient
+import com.spotify.sdk.android.auth.AuthorizationRequest
+import com.spotify.sdk.android.auth.AuthorizationResponse
 import kotlin.math.roundToInt
 
 class MainActivity : Activity(), WalkmanView.Listener {
@@ -37,10 +41,13 @@ class MainActivity : Activity(), WalkmanView.Listener {
     companion object {
         const val CLIENT_ID = "1d4f1c05d332459b8ff8cd74e247cf9a"
         const val REDIRECT_URI = "walkmanul://callback"
+        const val AUTH_REQ = 1337
     }
 
     private var remote: SpotifyAppRemote? = null
     private var connecting = false
+    private var authorized = false
+    private var authInFlight = false
     private lateinit var walkman: WalkmanView
     private lateinit var rack: LinearLayout
     private lateinit var rackStatus: TextView
@@ -68,7 +75,7 @@ class MainActivity : Activity(), WalkmanView.Listener {
         sounds = Sounds(this)
 
         val root = FrameLayout(this)
-        root.setBackgroundColor(0xFF2B1E15.toInt())
+        root.setBackgroundColor(0xFF0D0E10.toInt())
         walkman = WalkmanView(this)
         walkman.listener = this
         root.addView(walkman, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -76,7 +83,23 @@ class MainActivity : Activity(), WalkmanView.Listener {
         rack.visibility = View.GONE
         root.addView(rack, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         setContentView(root)
+        hideBars()
         syncVolume(false)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideBars()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun hideBars() {
+        window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            or View.SYSTEM_UI_FLAG_FULLSCREEN
+            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+            or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN)
     }
 
     override fun onStart() {
@@ -102,6 +125,7 @@ class MainActivity : Activity(), WalkmanView.Listener {
     // ================= Spotify =================
 
     private fun connect() {
+        if (!authorized) { startAuth(); return }
         if (remote != null || connecting) return
         if (!SpotifyAppRemote.isSpotifyInstalled(this)) {
             walkman.statusText = "Instala la app de Spotify en este teléfono"
@@ -112,7 +136,7 @@ class MainActivity : Activity(), WalkmanView.Listener {
         walkman.statusText = "Conectando con Spotify…"
         val params = ConnectionParams.Builder(CLIENT_ID)
             .setRedirectUri(REDIRECT_URI)
-            .showAuthView(true)
+            .showAuthView(false)
             .build()
         SpotifyAppRemote.connect(this, params, object : Connector.ConnectionListener {
             override fun onConnected(appRemote: SpotifyAppRemote) {
@@ -128,15 +152,47 @@ class MainActivity : Activity(), WalkmanView.Listener {
                 remote = null
                 walkman.connected = false
                 val name = error.javaClass.simpleName
+                val detail = name + ": " + (error.message ?: "")
                 walkman.statusText = when {
-                    name.contains("NotLoggedIn") -> "Inicia sesión en la app de Spotify y toca el casete"
-                    name.contains("UserNotAuthorized") || name.contains("Authentication") -> "Autoriza Walkman UL en Spotify (toca el casete)"
+                    name.contains("NotLoggedIn") -> "Inicia sesión en la app de Spotify · $detail"
+                    name.contains("UserNotAuthorized") || name.contains("Authentication") -> { authorized = false; "Falta autorizar · $detail" }
                     name.contains("CouldNotFindSpotifyApp") -> "Instala la app de Spotify"
                     name.contains("OfflineMode") -> "Spotify está sin conexión"
-                    else -> "Sin conexión: " + (error.message ?: name)
+                    else -> detail
                 }
+                toast(walkman.statusText)
             }
         })
+    }
+
+    private fun startAuth() {
+        if (authInFlight) return
+        authInFlight = true
+        walkman.statusText = "Pidiendo permiso a Spotify…"
+        val req = AuthorizationRequest.Builder(CLIENT_ID, AuthorizationResponse.Type.TOKEN, REDIRECT_URI)
+            .setScopes(arrayOf("app-remote-control", "streaming", "user-read-playback-state", "user-modify-playback-state"))
+            .setShowDialog(false)
+            .build()
+        AuthorizationClient.openLoginActivity(this, AUTH_REQ, req)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != AUTH_REQ) return
+        authInFlight = false
+        val resp = AuthorizationClient.getResponse(resultCode, data)
+        when (resp.type) {
+            AuthorizationResponse.Type.TOKEN -> {
+                authorized = true
+                connect()
+            }
+            AuthorizationResponse.Type.ERROR -> {
+                walkman.statusText = "Spotify rechazó el acceso: " + resp.error
+                toast(walkman.statusText)
+            }
+            else -> walkman.statusText = "Autorización cancelada · toca el casete"
+        }
     }
 
     private fun onPlayerState(ps: PlayerState) {
