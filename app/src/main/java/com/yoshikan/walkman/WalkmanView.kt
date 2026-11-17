@@ -1,9 +1,7 @@
 package com.yoshikan.walkman
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
@@ -17,13 +15,12 @@ import android.text.TextUtils
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import kotlin.math.exp
 import kotlin.math.min
+import kotlin.random.Random
 
-/**
- * Casete a pantalla completa con 5 teclas mecánicas abajo.
- * Teclas: 0 REW, 1 FF, 2 PLAY, 3 STOP/EJECT, 4 PAUSE.
- */
-class WalkmanView(context: Context) : View(context) {
+/** Pantalla: barra superior, aparato (skin), tira de información y 5 teclas mecánicas. */
+class WalkmanView(context: Context, val skins: List<Skin>) : View(context) {
 
     interface Listener {
         fun onPlayKey()
@@ -32,98 +29,93 @@ class WalkmanView(context: Context) : View(context) {
         fun onSkip(dir: Int)
         fun onScanStart(dir: Int)
         fun onScanEnd()
-        fun onVolume(fraction: Float)
-        fun onSwitch(index: Int, on: Boolean)
-        fun onCassetteTap()
+        fun onDeviceTap()
+        fun onSeek(fraction: Float)
         fun onKeySound(down: Boolean)
-        fun onSwitchSound()
+        fun onSkinChanged(index: Int)
+        fun onSkinMenu()
+        fun onOpenShelf()
+        fun onToggleMute()
+        fun onToggleAmbient()
     }
 
     var listener: Listener? = null
+    val deck = Deck()
+    var skinIndex = 0
+        set(v) { field = (v + skins.size) % skins.size; relayout() }
+    var muted = false
+    var ambientOn = false
 
-    // ---------- estado ----------
-    var connected = false
-    var isPlaying = false
-    var hasTrack = false
-    var title = ""
-    var artist = ""
-    var statusText = "Conectando con Spotify…"
-    var art: Bitmap? = null
-    private var durationMs = 1L
-    private var basePosMs = 0L
-    private var baseTime = 0L
-
-    // ---------- interacción ----------
-    private var pressedKey = -1
-    private var scanDir = 0
-    private var scanning = false
-    private val longPress = Runnable {
-        if (pressedKey == 0 || pressedKey == 1) {
-            scanning = true
-            scanDir = if (pressedKey == 0) -1 else 1
-            listener?.onScanStart(scanDir)
-        }
-    }
-
-    // ---------- animación ----------
-    private var reelAngleL = 0f
-    private var reelAngleR = 0f
-    private var lastFrame = 0L
-    private val keyAnim = FloatArray(5)
-
-    // ---------- geometría ----------
+    private val dp = resources.displayMetrics.density
+    private val btnPrev = RectF(); private val btnName = RectF(); private val btnNext = RectF()
+    private val btnShelf = RectF(); private val btnAmb = RectF(); private val btnSnd = RectF()
+    private var compact = false
+    private val info = RectF()
+    private val device = RectF()
     private var keyH = 0f
-    private var deckTop = 0f
     private val keyRects = Array(5) { RectF() }
     private val keyHit = Array(5) { RectF() }
-    private val shell = RectF()
-    private val label = RectF()
-    private val window = RectF()
-    private val artRect = RectF()
-    private var reelCy = 0f; private var reelLx = 0f; private var reelRx = 0f
-    private var hubR = 0f; private var rMin = 0f; private var rMax = 0f
-    private var ledX = 0f; private var ledY = 0f; private var ledR = 0f
-    private var staticLayer: Bitmap? = null
+    private val keyNames = arrayOf("REW", "FF", "PLAY", "STOP / EJECT", "PAUSE")
+    private val keyAnim = FloatArray(5)
 
-    // ---------- pinturas ----------
+    private var pressedKey = -1
+    private var scanning = false
+    private var skinTouch = false
+    private var lastFrame = 0L
+    private val rnd = Random(1)
+
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val tp = TextPaint(Paint.ANTI_ALIAS_FLAG)
     private val condensed = Typeface.create("sans-serif-condensed", Typeface.BOLD)
-    private val hand = Typeface.create("casual", Typeface.BOLD)
-    private val keyNames = arrayOf("REW", "FF", "PLAY", "STOP / EJECT", "PAUSE")
 
-    init { isHapticFeedbackEnabled = true }
-
-    // ================= API pública =================
-
-    fun updatePlayer(playing: Boolean, posMs: Long, durMs: Long, t: String, a: String, shuffle: Boolean, repeat: Boolean) {
-        isPlaying = playing
-        basePosMs = posMs
-        baseTime = SystemClock.uptimeMillis()
-        durationMs = if (durMs > 0) durMs else 1L
-        hasTrack = t.isNotEmpty()
-        title = t
-        artist = a
-        invalidate()
+    private val longPress = Runnable {
+        if (pressedKey == 0 || pressedKey == 1) {
+            scanning = true
+            deck.scanDir = if (pressedKey == 0) -1 else 1
+            listener?.onScanStart(deck.scanDir)
+        }
     }
 
-    fun setVolumeFraction(f: Float, show: Boolean) {}
-    fun setSwitch(i: Int, on: Boolean) {}
-
-    private fun currentPosMs(): Long {
-        val pos = if (isPlaying) basePosMs + (SystemClock.uptimeMillis() - baseTime) else basePosMs
-        return pos.coerceIn(0L, durationMs)
+    init {
+        isHapticFeedbackEnabled = true
+        for (s in skins) {
+            s.onSeek = { f -> listener?.onSeek(f) }
+            s.onSkip = { dir -> listener?.onSkip(dir) }
+        }
     }
 
-    // ================= layout =================
+    fun skin() = skins[skinIndex]
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (w == 0 || h == 0) return
+        relayout()
+    }
 
-        // fila de teclas abajo
-        keyH = h * 0.17f
-        deckTop = h - keyH - h * 0.03f
+    private fun relayout() {
+        val w = width.toFloat(); val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        val portrait = h > w
+        compact = w < 560 * dp
+
+        // barra superior
+        val topH = 44 * dp
+        val pad = 8 * dp
+        val bh = 34 * dp
+        val by = (topH - bh) / 2f + 4 * dp
+        btnPrev.set(pad, by, pad + bh, by + bh)
+        tp.typeface = condensed; tp.textSize = 15 * dp
+        val nameW = (tp.measureText(skin().name.uppercase()) + 24 * dp).coerceAtMost(w * 0.42f)
+        btnName.set(btnPrev.right + 4 * dp, by, btnPrev.right + 4 * dp + nameW, by + bh)
+        btnNext.set(btnName.right + 4 * dp, by, btnName.right + 4 * dp + bh, by + bh)
+        val pillW = if (compact) bh else 112 * dp
+        btnSnd.set(w - pad - pillW, by, w - pad, by + bh)
+        btnAmb.set(btnSnd.left - 6 * dp - pillW, by, btnSnd.left - 6 * dp, by + bh)
+        btnShelf.set(btnAmb.left - 6 * dp - pillW, by, btnAmb.left - 6 * dp, by + bh)
+
+        // teclas
+        keyH = if (portrait) min(h * 0.11f, w * 0.26f) else h * 0.17f
+        val bottomPad = if (portrait) 22 * dp else 8 * dp
+        val deckTop = h - keyH - bottomPad
         val margin = w * 0.03f
         val gap = w * 0.012f
         val weights = floatArrayOf(1f, 1f, 1.35f, 1.35f, 1f)
@@ -132,64 +124,15 @@ class WalkmanView(context: Context) : View(context) {
         for (i in 0 until 5) {
             val kw = unit * weights[i]
             keyRects[i].set(x, deckTop, x + kw, deckTop + keyH)
-            keyHit[i].set(x - gap / 2, deckTop - h * 0.03f, x + kw + gap / 2, h.toFloat())
+            keyHit[i].set(x - gap / 2, deckTop - 12 * dp, x + kw + gap / 2, h)
             x += kw + gap
         }
 
-        // casete: ocupa todo el espacio de arriba manteniendo proporción real (≈1.56:1)
-        val areaTop = h * 0.035f
-        val areaBottom = deckTop - h * 0.04f
-        val areaH = areaBottom - areaTop
-        var sw = w * 0.96f
-        var sh = sw / 1.56f
-        if (sh > areaH) { sh = areaH; sw = sh * 1.56f }
-        val sl = (w - sw) / 2f
-        shell.set(sl, areaTop + (areaH - sh) / 2f, sl + sw, areaTop + (areaH - sh) / 2f + sh)
-
-        label.set(
-            shell.left + shell.width() * 0.05f, shell.top + shell.height() * 0.07f,
-            shell.right - shell.width() * 0.05f, shell.bottom - shell.height() * 0.28f
-        )
-        val winW = shell.width() * 0.50f
-        val winH = label.height() * 0.40f
-        val winCy = label.top + label.height() * 0.60f
-        window.set(shell.centerX() - winW / 2f, winCy - winH / 2f, shell.centerX() + winW / 2f, winCy + winH / 2f)
-        val artS = min(window.height() * 1.2f, (window.left - label.left) * 0.80f)
-        val artL = label.left + (window.left - label.left - artS) / 2f
-        artRect.set(artL, winCy - artS / 2f, artL + artS, winCy + artS / 2f)
-        reelCy = window.centerY()
-        reelLx = window.left + window.width() * 0.22f
-        reelRx = window.right - window.width() * 0.22f
-        hubR = window.height() * 0.27f
-        rMin = hubR * 1.2f
-        rMax = (reelRx - reelLx) - rMin - hubR * 0.15f
-
-        ledR = shell.height() * 0.022f
-        ledX = shell.right - shell.width() * 0.07f
-        ledY = shell.bottom - shell.height() * 0.12f
-
-        staticLayer?.recycle()
-        staticLayer = buildStatic(w, h)
-    }
-
-    private fun buildStatic(w: Int, h: Int): Bitmap {
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val c = Canvas(bmp)
-        p.reset(); p.isAntiAlias = true
-        // fondo
-        p.shader = RadialGradient(w / 2f, h * 0.4f, w * 0.75f, 0xFF2A2D33.toInt(), 0xFF0D0E10.toInt(), Shader.TileMode.CLAMP)
-        c.drawRect(0f, 0f, w.toFloat(), h.toFloat(), p)
-        p.shader = null
-        // ranura de las teclas
-        p.color = 0xFF050506.toInt()
-        val slot = RectF(keyRects[0].left - 8f, deckTop - 8f, keyRects[4].right + 8f, deckTop + keyH + 8f)
-        c.drawRoundRect(slot, keyH * 0.2f, keyH * 0.2f, p)
-        // sombra del casete
-        p.color = Color.BLACK
-        p.setShadowLayer(shell.height() * 0.05f, 0f, shell.height() * 0.025f, 0xCC000000.toInt())
-        c.drawRoundRect(shell, shell.height() * 0.04f, shell.height() * 0.04f, p)
-        p.clearShadowLayer()
-        return bmp
+        // información de la canción
+        val infoH = if (portrait) 62 * dp else 40 * dp
+        info.set(margin, deckTop - infoH - 10 * dp, w - margin, deckTop - 10 * dp)
+        device.set(w * 0.03f, topH + 8 * dp, w * 0.97f, info.top - 8 * dp)
+        skin().layout(device)
     }
 
     // ================= dibujo =================
@@ -198,60 +141,201 @@ class WalkmanView(context: Context) : View(context) {
         val now = SystemClock.uptimeMillis()
         val dt = if (lastFrame == 0L) 0f else min((now - lastFrame) / 1000f, 0.05f)
         lastFrame = now
+        updateMotion(dt, now)
 
-        for (i in 0 until 5) {
-            val down = pressedKey == i || (i == 2 && isPlaying)
-            keyAnim[i] += ((if (down) 1f else 0f) - keyAnim[i]) * min(1f, dt * 28f)
-        }
-        val progress = if (hasTrack) (currentPosMs().toFloat() / durationMs).coerceIn(0f, 1f) else 0f
-        val leftR = rMin + (rMax - rMin) * (1f - progress)
-        val rightR = rMin + (rMax - rMin) * progress
-        val tapeSpeed = when {
-            scanning -> rMin * 10f * scanDir
-            isPlaying -> rMin * 1.8f
-            else -> 0f
-        }
-        reelAngleL += dt * tapeSpeed / leftR * 57.3f
-        reelAngleR += dt * tapeSpeed / rightR * 57.3f
+        val s = skin()
+        val w = width.toFloat(); val h = height.toFloat()
+        p.reset(); p.isAntiAlias = true
+        p.shader = RadialGradient(w / 2f, h * 0.4f, maxOf(w, h) * 0.75f, s.bgTop, s.bgBottom, Shader.TileMode.CLAMP)
+        c.drawRect(0f, 0f, w, h, p)
+        p.shader = null
 
-        staticLayer?.let { c.drawBitmap(it, 0f, 0f, null) }
-        drawCassette(c, leftR, rightR)
-        drawLed(c, now)
-        drawKeys(c)
-
+        s.draw(c, deck, dt, now)
+        drawTopBar(c)
+        drawInfo(c)
+        drawKeys(c, dt)
         postInvalidateOnAnimation()
     }
 
-    private fun drawKeys(c: Canvas) {
+    private fun updateMotion(dt: Float, now: Long) {
+        val d = deck
+        val target = when {
+            d.scanDir != 0 -> d.scanDir * 6f
+            d.isPlaying -> 1f
+            else -> 0f
+        }
+        d.spin += (target - d.spin) * min(1f, dt * 3f)
+        if (d.isPlaying) {
+            val ph = (now % 500L) / 500f
+            val kick = exp(-ph * 6f)
+            d.level += ((0.25f + 0.55f * kick + rnd.nextFloat() * 0.2f) - d.level) * min(1f, dt * 14f)
+            d.levelL += ((0.3f + 0.5f * kick + rnd.nextFloat() * 0.25f) - d.levelL) * min(1f, dt * 10f)
+            d.levelR += ((0.3f + 0.5f * kick + rnd.nextFloat() * 0.25f) - d.levelR) * min(1f, dt * 10f)
+        } else {
+            d.level *= 0.9f; d.levelL *= 0.9f; d.levelR *= 0.9f
+        }
+        for (i in d.bands.indices) {
+            val tgt = if (d.isPlaying) (d.level * (0.35f + 0.65f * rnd.nextFloat()) * (1.15f - i * 0.05f)).coerceIn(0f, 1f) else 0f
+            d.bands[i] += (tgt - d.bands[i]) * min(1f, dt * 12f)
+        }
+    }
+
+    private fun pill(c: Canvas, r: RectF, on: Boolean) {
+        p.color = if (on) (skin().accent and 0x00FFFFFF) or 0xCC000000.toInt() else 0x33FFFFFF
+        c.drawRoundRect(r, r.height() / 2f, r.height() / 2f, p)
+    }
+
+    private fun drawTopBar(c: Canvas) {
         p.reset(); p.isAntiAlias = true
+        pill(c, btnPrev, false); pill(c, btnName, false); pill(c, btnNext, false)
+        val ink = 0xFFFFFFFF.toInt()
+        p.color = ink
+        arrow(c, btnPrev, -1); arrow(c, btnNext, 1)
+        tp.typeface = condensed; tp.textAlign = Paint.Align.CENTER; tp.textSize = 15 * dp; tp.color = ink
+        val nm = TextUtils.ellipsize(skin().name.uppercase(), tp, btnName.width() - 16 * dp, TextUtils.TruncateAt.END).toString()
+        c.drawText(nm, btnName.centerX(), btnName.centerY() + tp.textSize * 0.36f, tp)
+
+        pill(c, btnShelf, false); pill(c, btnAmb, ambientOn); pill(c, btnSnd, !muted)
+        iconLabel(c, btnShelf, 0, "RECIENTES")
+        iconLabel(c, btnAmb, 1, "AMBIENTE")
+        iconLabel(c, btnSnd, if (muted) 3 else 2, if (muted) "SIN SONIDO" else "SONIDOS")
+    }
+
+    private fun arrow(c: Canvas, r: RectF, dir: Int) {
+        val s = r.height() * 0.2f
+        val path = Path()
+        path.moveTo(r.centerX() - s * 0.6f * dir, r.centerY() - s)
+        path.lineTo(r.centerX() + s * 0.6f * dir, r.centerY())
+        path.lineTo(r.centerX() - s * 0.6f * dir, r.centerY() + s)
+        path.close()
+        c.drawPath(path, p)
+    }
+
+    private fun iconLabel(c: Canvas, r: RectF, icon: Int, label: String) {
+        val s = r.height() * 0.22f
+        val ix = if (compact) r.centerX() else r.left + r.height() * 0.55f
+        val iy = r.centerY()
+        p.color = 0xFFFFFFFF.toInt()
+        p.style = Paint.Style.STROKE; p.strokeWidth = 2 * dp; p.strokeCap = Paint.Cap.ROUND
+        when (icon) {
+            0 -> for (k in -1..1) c.drawLine(ix - s, iy + k * s * 0.7f, ix + s, iy + k * s * 0.7f, p)
+            1 -> {
+                val wp = Path()
+                for (k in 0..1) {
+                    val yy = iy - s * 0.4f + k * s * 0.8f
+                    wp.moveTo(ix - s, yy)
+                    wp.cubicTo(ix - s * 0.5f, yy - s * 0.5f, ix, yy + s * 0.5f, ix + s * 0.5f, yy)
+                    wp.lineTo(ix + s, yy - s * 0.2f)
+                }
+                c.drawPath(wp, p)
+            }
+            else -> {
+                p.style = Paint.Style.FILL
+                val sp = Path()
+                sp.moveTo(ix - s, iy - s * 0.35f); sp.lineTo(ix - s * 0.5f, iy - s * 0.35f); sp.lineTo(ix, iy - s * 0.9f)
+                sp.lineTo(ix, iy + s * 0.9f); sp.lineTo(ix - s * 0.5f, iy + s * 0.35f); sp.lineTo(ix - s, iy + s * 0.35f); sp.close()
+                c.drawPath(sp, p)
+                p.style = Paint.Style.STROKE
+                if (icon == 2) {
+                    c.drawArc(RectF(ix - s * 0.2f, iy - s * 0.6f, ix + s * 0.6f, iy + s * 0.6f), -50f, 100f, false, p)
+                } else {
+                    c.drawLine(ix + s * 0.3f, iy - s * 0.4f, ix + s, iy + s * 0.4f, p)
+                    c.drawLine(ix + s * 0.3f, iy + s * 0.4f, ix + s, iy - s * 0.4f, p)
+                }
+            }
+        }
+        p.style = Paint.Style.FILL; p.strokeCap = Paint.Cap.BUTT
+        if (!compact) {
+            tp.typeface = condensed; tp.textAlign = Paint.Align.LEFT; tp.textSize = 13 * dp; tp.color = 0xFFFFFFFF.toInt()
+            c.drawText(label, ix + s * 1.6f, iy + tp.textSize * 0.36f, tp)
+        }
+    }
+
+    private fun drawInfo(c: Canvas) {
+        val d = deck
+        val s = skin()
+        val portrait = height > width
+        tp.typeface = condensed; tp.textAlign = Paint.Align.LEFT
+        val t1: String; val t2: String; val red: Boolean
+        when {
+            !d.connected -> { t1 = "Toca el aparato para conectar con Spotify"; t2 = d.status; red = true }
+            !d.hasTrack -> { t1 = "Sin música"; t2 = "STOP / EJECT abre tus recientes"; red = false }
+            else -> { t1 = d.title; t2 = listOf(d.artist, d.album).filter { it.isNotEmpty() }.joinToString(" · "); red = false }
+        }
+        val barH = 4 * dp
+        val barY = info.bottom - barH
+        if (portrait) {
+            tp.textSize = 19 * dp; tp.color = 0xFFFFFFFF.toInt()
+            c.drawText(TextUtils.ellipsize(t1, tp, info.width(), TextUtils.TruncateAt.END).toString(), info.left, info.top + 20 * dp, tp)
+            tp.textSize = 14 * dp; tp.color = if (red) 0xFFFF8A80.toInt() else 0xB3FFFFFF.toInt()
+            c.drawText(TextUtils.ellipsize(t2, tp, info.width(), TextUtils.TruncateAt.END).toString(), info.left, info.top + 40 * dp, tp)
+        } else {
+            tp.textSize = 16 * dp; tp.color = 0xFFFFFFFF.toInt()
+            val tw = info.width() * 0.5f
+            c.drawText(TextUtils.ellipsize(t1, tp, tw, TextUtils.TruncateAt.END).toString(), info.left, info.top + 18 * dp, tp)
+            tp.textSize = 13 * dp; tp.color = if (red) 0xFFFF8A80.toInt() else 0xB3FFFFFF.toInt()
+            tp.textAlign = Paint.Align.RIGHT
+            c.drawText(TextUtils.ellipsize(t2, tp, info.width() * 0.45f, TextUtils.TruncateAt.END).toString(), info.right, info.top + 18 * dp, tp)
+        }
+        if (d.hasTrack) {
+            p.color = 0x33FFFFFF
+            c.drawRoundRect(RectF(info.left, barY, info.right, barY + barH), barH, barH, p)
+            p.color = s.accent
+            c.drawRoundRect(RectF(info.left, barY, info.left + info.width() * d.progress(), barY + barH), barH, barH, p)
+            tp.textSize = 11 * dp; tp.color = 0x99FFFFFF.toInt()
+            tp.textAlign = Paint.Align.LEFT
+            c.drawText(fmt(d.pos()), info.left, barY - 4 * dp, tp)
+            tp.textAlign = Paint.Align.RIGHT
+            c.drawText(fmt(d.durationMs), info.right, barY - 4 * dp, tp)
+        }
+    }
+
+    private fun fmt(ms: Long): String {
+        val s = ms / 1000
+        return "%d:%02d".format(s / 60, s % 60)
+    }
+
+    private fun drawKeys(c: Canvas, dt: Float) {
+        val s = skin()
+        p.reset(); p.isAntiAlias = true
+        p.color = 0xFF050506.toInt()
+        c.drawRoundRect(RectF(keyRects[0].left - 6 * dp, keyRects[0].top - 6 * dp, keyRects[4].right + 6 * dp, keyRects[0].bottom + 6 * dp), keyH * 0.2f, keyH * 0.2f, p)
         for (i in 0 until 5) {
+            val down = pressedKey == i || (i == 2 && deck.isPlaying)
+            keyAnim[i] += ((if (down) 1f else 0f) - keyAnim[i]) * min(1f, dt * 28f)
             val k = keyRects[i]
             val off = keyAnim[i] * keyH * 0.08f
             val r = RectF(k.left, k.top + off, k.right, k.bottom)
             val play = i == 2
-            // lateral (profundidad)
-            p.color = if (play) 0xFF8A3E10.toInt() else 0xFF15161A.toInt()
+            val light = if (play) lighten(s.accent) else s.keyLight
+            val dark = if (play) s.accent else s.keyDark
+            val ink = if (play) 0xFF1A1208.toInt() else s.keyInk
+            p.color = darken(dark)
             c.drawRoundRect(r, keyH * 0.14f, keyH * 0.14f, p)
-            // cara
             val face = RectF(r.left, r.top, r.right, r.bottom - keyH * 0.09f * (1f - keyAnim[i]) - keyH * 0.02f)
-            p.shader = LinearGradient(0f, face.top, 0f, face.bottom,
-                if (play) 0xFFF6A066.toInt() else 0xFF5C6068.toInt(),
-                if (play) 0xFFE0661F.toInt() else 0xFF33363C.toInt(), Shader.TileMode.CLAMP)
+            p.shader = LinearGradient(0f, face.top, 0f, face.bottom, light, dark, Shader.TileMode.CLAMP)
             c.drawRoundRect(face, keyH * 0.14f, keyH * 0.14f, p)
             p.shader = null
-            // símbolo y nombre
-            val ink = if (play) 0xFF2A1408.toInt() else 0xFFE6E8EC.toInt()
             p.color = ink
-            drawSymbol(c, i, face.centerX(), face.top + face.height() * 0.40f, face.height() * 0.17f)
-            tp.typeface = condensed
-            tp.textAlign = Paint.Align.CENTER
-            tp.textSize = face.height() * 0.17f
+            symbol(c, i, face.centerX(), face.top + face.height() * 0.40f, face.height() * 0.17f)
+            tp.typeface = condensed; tp.textAlign = Paint.Align.CENTER
+            tp.textSize = min(face.height() * 0.17f, face.width() * 0.16f)
             tp.color = ink
             c.drawText(keyNames[i], face.centerX(), face.top + face.height() * 0.82f, tp)
         }
     }
 
-    private fun drawSymbol(c: Canvas, i: Int, cx: Float, cy: Float, s: Float) {
+    private fun lighten(c: Int): Int {
+        val r = ((c shr 16) and 0xFF); val g = ((c shr 8) and 0xFF); val b = (c and 0xFF)
+        return (0xFF shl 24) or (minOf(255, r + 50) shl 16) or (minOf(255, g + 50) shl 8) or minOf(255, b + 50)
+    }
+
+    private fun darken(c: Int): Int {
+        val r = ((c shr 16) and 0xFF) / 2; val g = ((c shr 8) and 0xFF) / 2; val b = (c and 0xFF) / 2
+        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+    }
+
+    private fun symbol(c: Canvas, i: Int, cx: Float, cy: Float, s: Float) {
         val path = Path()
         fun tri(x: Float, dir: Int) {
             path.moveTo(x - s * 0.5f * dir, cy - s * 0.6f)
@@ -279,208 +363,50 @@ class WalkmanView(context: Context) : View(context) {
         c.drawPath(path, p)
     }
 
-    private fun drawCassette(c: Canvas, leftR: Float, rightR: Float) {
-        p.reset(); p.isAntiAlias = true
-        val sr = shell.height() * 0.04f
-
-        // carcasa
-        p.shader = LinearGradient(0f, shell.top, 0f, shell.bottom, 0xFF3A3C41.toInt(), 0xFF202226.toInt(), Shader.TileMode.CLAMP)
-        c.drawRoundRect(shell, sr, sr, p)
-        p.shader = null
-        p.style = Paint.Style.STROKE; p.strokeWidth = 2f; p.color = 0x33FFFFFF
-        c.drawRoundRect(shell, sr, sr, p)
-        p.style = Paint.Style.FILL
-
-        // tornillos de la carcasa
-        val scR = shell.height() * 0.022f
-        for (fx in floatArrayOf(0.025f, 0.975f)) for (fy in floatArrayOf(0.035f, 0.94f)) screw(c, shell.left + shell.width() * fx, shell.top + shell.height() * fy, scR)
-        screw(c, shell.centerX(), shell.top + shell.height() * 0.035f, scR)
-
-        // trapecio inferior
-        val trap = Path()
-        val tTop = shell.bottom - shell.height() * 0.22f
-        trap.moveTo(shell.left + shell.width() * 0.13f, shell.bottom)
-        trap.lineTo(shell.left + shell.width() * 0.19f, tTop)
-        trap.lineTo(shell.right - shell.width() * 0.19f, tTop)
-        trap.lineTo(shell.right - shell.width() * 0.13f, shell.bottom)
-        trap.close()
-        p.color = 0xFF46494F.toInt()
-        c.drawPath(trap, p)
-        p.color = 0xFF111214.toInt()
-        val holeY = tTop + (shell.bottom - tTop) * 0.5f
-        for (fx in floatArrayOf(0.30f, 0.42f, 0.58f, 0.70f)) c.drawCircle(shell.left + shell.width() * fx, holeY, shell.height() * 0.025f, p)
-        p.color = 0xFF5A3A24.toInt()
-        c.drawRect(shell.left + shell.width() * 0.22f, shell.bottom - shell.height() * 0.03f, shell.right - shell.width() * 0.22f, shell.bottom - shell.height() * 0.012f, p)
-
-        // etiqueta
-        val lr = shell.height() * 0.02f
-        p.color = 0xFFF3E9D2.toInt()
-        c.drawRoundRect(label, lr, lr, p)
-        val stripeTop = window.bottom + label.height() * 0.06f
-        val sh = (label.bottom - stripeTop) / 3f
-        val stripeColors = intArrayOf(0xFFE8742B.toInt(), 0xFFD9472B.toInt(), 0xFF1F3A68.toInt())
-        for (k in 0 until 3) {
-            p.color = stripeColors[k]
-            c.drawRect(label.left, stripeTop + sh * k, label.right, stripeTop + sh * (k + 1), p)
-        }
-        p.color = 0x553C6EA8
-        p.strokeWidth = 1.5f
-        val lineTop = label.top + label.height() * 0.24f
-        val lineGap = label.height() * 0.15f
-        c.drawLine(label.left + label.width() * 0.09f, lineTop, label.right - label.width() * 0.03f, lineTop, p)
-        c.drawLine(label.left + label.width() * 0.09f, lineTop + lineGap, label.right - label.width() * 0.03f, lineTop + lineGap, p)
-
-        tp.typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
-        tp.textAlign = Paint.Align.CENTER
-        tp.color = 0xFFD9472B.toInt()
-        tp.textSize = label.height() * 0.22f
-        c.drawText("A", label.left + label.width() * 0.045f, lineTop + tp.textSize * 0.15f, tp)
-
-        // texto manuscrito
-        tp.typeface = hand
-        tp.textAlign = Paint.Align.LEFT
-        tp.color = 0xFF1C2F5A.toInt()
-        val textX = label.left + label.width() * 0.09f
-        val textW = label.right - label.width() * 0.03f - textX
-        val t1: String
-        val t2: String
-        when {
-            !connected -> { t1 = "Spotify · toca el casete para conectar"; t2 = statusText }
-            !hasTrack -> { t1 = "Sin casete"; t2 = "STOP / EJECT para elegir uno" }
-            else -> { t1 = title; t2 = artist }
-        }
-        tp.textSize = label.height() * 0.15f
-        c.drawText(TextUtils.ellipsize(t1, tp, textW, TextUtils.TruncateAt.END).toString(), textX, lineTop - label.height() * 0.03f, tp)
-        tp.textSize = label.height() * 0.11f
-        tp.color = if (connected) 0xFF3B4E78.toInt() else 0xFFB3261E.toInt()
-        c.drawText(TextUtils.ellipsize(t2, tp, textW, TextUtils.TruncateAt.END).toString(), textX, lineTop + lineGap - label.height() * 0.03f, tp)
-
-        // portada
-        val a = art
-        if (a != null && !a.isRecycled) {
-            c.drawBitmap(a, null, artRect, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
-        } else {
-            p.color = 0xFFE0D3B5.toInt(); c.drawRect(artRect, p)
-            p.color = 0xFFB9A982.toInt(); c.drawCircle(artRect.centerX(), artRect.centerY(), artRect.width() * 0.3f, p)
-            p.color = 0xFFE0D3B5.toInt(); c.drawCircle(artRect.centerX(), artRect.centerY(), artRect.width() * 0.08f, p)
-        }
-        p.style = Paint.Style.STROKE; p.strokeWidth = 1.5f; p.color = 0x55000000
-        c.drawRect(artRect, p)
-        p.style = Paint.Style.FILL
-
-        // tiempo
-        if (hasTrack) {
-            tp.typeface = condensed
-            tp.textAlign = Paint.Align.CENTER
-            tp.color = 0xFF1C2F5A.toInt()
-            tp.textSize = window.height() * 0.32f
-            val rx = (window.right + label.right) / 2f
-            c.drawText(fmt(currentPosMs()), rx, window.centerY() - tp.textSize * 0.15f, tp)
-            tp.color = 0xFF6B7690.toInt()
-            tp.textSize = window.height() * 0.25f
-            c.drawText(fmt(durationMs), rx, window.centerY() + tp.textSize * 1.05f, tp)
-        }
-
-        // ventana con carretes
-        val wr = window.height() * 0.5f
-        p.color = 0xFF0E0F11.toInt()
-        c.drawRoundRect(window, wr, wr, p)
-        c.save()
-        val clip = Path(); clip.addRoundRect(window, wr, wr, Path.Direction.CW)
-        c.clipPath(clip)
-        drawPack(c, reelLx, leftR)
-        drawPack(c, reelRx, rightR)
-        drawHub(c, reelLx, reelAngleL)
-        drawHub(c, reelRx, reelAngleR)
-        p.color = 0x22FFFFFF
-        c.drawRect(window.left, window.top, window.right, window.top + window.height() * 0.18f, p)
-        c.restore()
-        p.style = Paint.Style.STROKE; p.strokeWidth = 2f; p.color = 0xFF8C8270.toInt()
-        c.drawRoundRect(window, wr, wr, p)
-        p.style = Paint.Style.FILL
-    }
-
-    private fun screw(c: Canvas, x: Float, y: Float, r: Float) {
-        p.shader = RadialGradient(x - r * 0.3f, y - r * 0.3f, r * 1.3f, 0xFFDADADA.toInt(), 0xFF5D636B.toInt(), Shader.TileMode.CLAMP)
-        c.drawCircle(x, y, r, p)
-        p.shader = null
-        p.color = 0xFF2F3338.toInt()
-        p.strokeWidth = r * 0.3f
-        c.drawLine(x - r * 0.6f, y - r * 0.6f, x + r * 0.6f, y + r * 0.6f, p)
-        c.drawLine(x - r * 0.6f, y + r * 0.6f, x + r * 0.6f, y - r * 0.6f, p)
-    }
-
-    private fun drawPack(c: Canvas, cx: Float, r: Float) {
-        p.shader = RadialGradient(cx, reelCy, r, intArrayOf(0xFF3E2A1C.toInt(), 0xFF6A4528.toInt(), 0xFF4A301E.toInt()), floatArrayOf(0f, 0.85f, 1f), Shader.TileMode.CLAMP)
-        c.drawCircle(cx, reelCy, r, p)
-        p.shader = null
-        p.style = Paint.Style.STROKE
-        p.strokeWidth = 1f
-        p.color = 0x22FFFFFF
-        var rr = rMin
-        while (rr < r) { c.drawCircle(cx, reelCy, rr, p); rr += hubR * 0.22f }
-        p.style = Paint.Style.FILL
-    }
-
-    private fun drawHub(c: Canvas, cx: Float, angle: Float) {
-        c.save()
-        c.rotate(angle, cx, reelCy)
-        p.color = 0xFFEDEDED.toInt()
-        c.drawCircle(cx, reelCy, hubR, p)
-        p.color = 0xFF2A2B2E.toInt()
-        c.drawCircle(cx, reelCy, hubR * 0.55f, p)
-        p.color = 0xFFEDEDED.toInt()
-        for (k in 0 until 6) {
-            c.save()
-            c.rotate(k * 60f, cx, reelCy)
-            c.drawRect(cx - hubR * 0.09f, reelCy - hubR * 0.56f, cx + hubR * 0.09f, reelCy - hubR * 0.30f, p)
-            c.restore()
-        }
-        p.color = 0xFFBFBFBF.toInt()
-        c.drawCircle(cx + hubR * 0.78f, reelCy, hubR * 0.08f, p)
-        c.restore()
-    }
-
-    private fun drawLed(c: Canvas, now: Long) {
-        val on: Boolean
-        val color: Int
-        if (connected) { on = true; color = 0xFF39E66B.toInt() } else { on = (now / 500) % 2 == 0L; color = 0xFFFF3B30.toInt() }
-        if (on) {
-            p.shader = RadialGradient(ledX, ledY, ledR * 3f, (color and 0x00FFFFFF) or 0x66000000, 0x00000000, Shader.TileMode.CLAMP)
-            c.drawCircle(ledX, ledY, ledR * 3f, p)
-            p.shader = null
-        }
-        p.color = if (on) color else 0xFF5A1E1A.toInt()
-        c.drawCircle(ledX, ledY, ledR, p)
-    }
-
-    private fun fmt(ms: Long): String {
-        val s = ms / 1000
-        return "%d:%02d".format(s / 60, s % 60)
-    }
-
     // ================= toques =================
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
-        val x = e.x
-        val y = e.y
+        val x = e.x; val y = e.y
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                when {
+                    btnPrev.contains(x, y) -> { changeSkin(-1); return true }
+                    btnNext.contains(x, y) -> { changeSkin(1); return true }
+                    btnName.contains(x, y) -> { listener?.onSkinMenu(); return true }
+                    btnShelf.contains(x, y) -> { tapFx(); listener?.onOpenShelf(); return true }
+                    btnAmb.contains(x, y) -> { tapFx(); listener?.onToggleAmbient(); return true }
+                    btnSnd.contains(x, y) -> { tapFx(); listener?.onToggleMute(); return true }
+                }
                 for (i in 0 until 5) if (keyHit[i].contains(x, y)) { pressKey(i); return true }
-                if (shell.contains(x, y)) { listener?.onCassetteTap(); return true }
+                val s = skin()
+                if (s.r.contains(x, y)) {
+                    if (deck.connected && s.touch(e, deck)) { skinTouch = true; return true }
+                    listener?.onDeviceTap()
+                    return true
+                }
                 return false
             }
+            MotionEvent.ACTION_MOVE -> if (skinTouch) skin().touch(e, deck)
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (skinTouch) { skin().touch(e, deck); skinTouch = false }
                 if (pressedKey >= 0) releaseKey(e.actionMasked == MotionEvent.ACTION_UP)
             }
         }
         return true
     }
 
+    private fun tapFx() { performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY) }
+
+    private fun changeSkin(dir: Int) {
+        tapFx()
+        skinIndex += dir
+        listener?.onSkinChanged(skinIndex)
+    }
+
     private fun pressKey(i: Int) {
         pressedKey = i
         listener?.onKeySound(true)
-        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        tapFx()
         when (i) {
             0, 1 -> postDelayed(longPress, 420)
             2 -> listener?.onPlayKey()
@@ -495,7 +421,7 @@ class WalkmanView(context: Context) : View(context) {
         if (i == 0 || i == 1) {
             if (scanning) {
                 scanning = false
-                scanDir = 0
+                deck.scanDir = 0
                 listener?.onScanEnd()
             } else if (up) {
                 listener?.onSkip(if (i == 0) -1 else 1)
